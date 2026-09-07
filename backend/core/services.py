@@ -1215,6 +1215,7 @@ def conversation_state_for_ai(conversation, business_settings, history_messages)
     whole_at = None
     last_album = []
     image_ids = []
+    albums_sent = 0
     for message in conversation.messages.filter(sender="system").order_by("created_at", "id"):
         album = (message.metadata or {}).get("catalog_album_result") or {}
         rows = [row for row in album.get("items") or [] if row.get("delivered")]
@@ -1222,6 +1223,7 @@ def conversation_state_for_ai(conversation, business_settings, history_messages)
             continue
         if album.get("whole_catalog"):
             whole_at = message.created_at
+        albums_sent += 1
         last_album = [{"position": row.get("position"), "catalog_id": row.get("catalog_id"),
                        "name": row.get("name"), "price": row.get("price")} for row in rows]
         if not album.get("whole_catalog"):
@@ -1252,6 +1254,15 @@ def conversation_state_for_ai(conversation, business_settings, history_messages)
         "working_hours": said(hours),
         "payment_types": bool(re.search(r"naqd|нақд|наличн|karta|карта", joined, re.IGNORECASE)),
     }
+    album_choice = None
+    if last_album:
+        maps = album_position_maps(conversation)
+        if maps:
+            choice = customer_album_choice(conversation, maps[-1])
+            if choice is not None:
+                chosen = next((row for row in last_album if row.get("position") == choice), None)
+                album_choice = {"position": choice, "catalog_id": (chosen or {}).get("catalog_id"),
+                                "name": (chosen or {}).get("name"), "price": (chosen or {}).get("price")}
     offered = bool(re.search(OPERATOR_OFFER_PATTERN, joined))
     notified = conversation.messages.filter(sender="system").filter(
         Q(metadata__has_key="operator_needed") | Q(metadata__has_key="operator_lead_notified")).exists()
@@ -1263,8 +1274,16 @@ def conversation_state_for_ai(conversation, business_settings, history_messages)
             # Mijoz raqam yozsa u shu ro'yxatdagi position. Nomi bo'yicha
             # qidirish boshqa mahsulotni topib qo'yishi mumkin.
             "last_album": last_album[-30:],
+            # Suhbatda bir necha albom ketgan bo'lsa mijozning ekranida faqat
+            # oxirgisi turadi va eskilarining raqamlari bekor. Real suhbat
+            # 3051 da AI eski albomning tartibini qaytarib boshqa gulni yozdi.
+            "albums_sent": albums_sent,
+            "older_album_numbers_void": albums_sent > 1,
         },
         "already_answered": answered,
+        # Mijoz albomdan raqam bilan tanlagan bo'lsa aynan shu mahsulot.
+        # Oxirgi albomdan olinadi — o'zining eski javobidagi tartib emas.
+        "album_choice": album_choice,
         "last_ai_reply": ai_texts[-1][:400] if ai_texts else "",
         "operator": {"offer_made": offered, "group_notified": notified},
     }
@@ -1343,6 +1362,105 @@ def album_item_by_price(conversation, price, name=""):
     return None
 
 
+ALBUM_CHOICE_PATTERN = re.compile(
+    r"^(\d{1,2})\s*(?:[-–—]?\s*(?:chi|chisi|chisini|nchi|inchi|raqamli|raqam|ni|si|niki|yi"
+    r"|чи|чиси|нчи|инчи|раками|ракамли|ни|си))?\s*[.!]?$",
+    re.IGNORECASE)
+ALBUM_CHOICE_MAX_LENGTH = 16
+
+
+def album_position_maps(conversation):
+    """Suhbatda yuborilgan har bir albomning raqam -> mahsulot jadvali.
+
+    Eng yangisi oxirida turadi. Ikkinchi albom yuborilishi bilan birinchisining
+    raqamlari bekor bo'ladi: mijozning ekranida oxirgi albom turadi.
+    """
+    maps = []
+    if conversation is None:
+        return maps
+    for message in conversation.messages.filter(sender="system").order_by("created_at", "id"):
+        album = (message.metadata or {}).get("catalog_album_result") or {}
+        positions = {}
+        for row in album.get("items") or []:
+            if not row.get("delivered"):
+                continue
+            position = row.get("position")
+            catalog_id = row.get("catalog_id")
+            if position and catalog_id:
+                positions[int(position)] = catalog_id
+        if positions:
+            maps.append({"sent_at": message.created_at, "positions": positions})
+    return maps
+
+
+def customer_album_choice(conversation, album):
+    """Albom yuborilgandan keyin mijoz yozgan yalang raqam.
+
+    Faqat qisqa xabar qaraladi va raqam albomdagi o'rin bo'lishi shart —
+    telefon raqami ham, summa ham bu shartdan o'tmaydi.
+    """
+    if not album:
+        return None
+    positions = album.get("positions") or {}
+    choice = None
+    for message in conversation.messages.filter(sender="customer", created_at__gte=album["sent_at"]).order_by("created_at", "id"):
+        text = " ".join((message.text or "").split())
+        if not text or len(text) > ALBUM_CHOICE_MAX_LENGTH:
+            continue
+        matched = ALBUM_CHOICE_PATTERN.match(text)
+        if not matched:
+            continue
+        value = int(matched.group(1))
+        if value in positions:
+            choice = value
+    return choice
+
+
+def stale_album_position_item(conversation, catalog_id):
+    """AI eskirgan albomning raqamlanishi bilan mahsulot tanlab qo'yganmi.
+
+    Real suhbat 3051: reklama rasmiga bitta albom ketdi (1 Alfalob, 2 Jumila),
+    o'n sakkiz soniyadan keyin reel bo'yicha to'qqiz rasmli ikkinchi albom
+    ketdi (1 Jumila, 2 Alfalob). AI javobida birinchi albomning tartibini
+    qaytardi, mijoz esa ekranidagi ikkinchi albomdan "2" deb yozdi — leadga
+    Alfalob o'rniga Jumila yozilib operatorga boshqa gulning rasmi ketdi.
+    Ikkalasi ham 199 000 bo'lgani uchun narx tuzatgichi buni ushlay olmadi.
+
+    Faqat shu aniq iz bo'yicha tuzatiladi: mijoz yozgan raqam eski albomda
+    aynan AI yozgan mahsulotga to'g'ri kelsa. Boshqa hollarda hech narsa
+    o'zgartirilmaydi — "1 yoki 2?" degan oddiy savolning javobi albom raqami
+    deb o'qilib qolmasligi kerak.
+    """
+    maps = album_position_maps(conversation)
+    if len(maps) < 2:
+        return None
+    latest = maps[-1]
+    choice = customer_album_choice(conversation, latest)
+    if choice is None:
+        return None
+    current_id = (latest.get("positions") or {}).get(choice)
+    if not current_id or current_id == catalog_id:
+        return None
+    for older in maps[:-1]:
+        if (older.get("positions") or {}).get(choice) == catalog_id:
+            return album_catalog_item(current_id)
+    return None
+
+
+def correct_lead_row_by_album_position(rows, conversation):
+    """Eskirgan albom raqami bilan yozilgan qatorni oxirgi albomga qaytaradi."""
+    if len(rows) != 1 or conversation is None:
+        return rows
+    row = rows[0]
+    if int(row.get("quantity") or 1) != 1 or not row.get("ai_catalog_item"):
+        return rows
+    item = stale_album_position_item(conversation, row["ai_catalog_item"])
+    if not item:
+        return rows
+    print("LEAD_CATALOG_CORRECTED_BY_POSITION from=%s to=%s" % (row.get("ai_catalog_item"), item.id), flush=True)
+    return [{"catalog_name": item.name, "quantity": 1, "ai_catalog_item": item.id, "price": str(item.price)}]
+
+
 def ai_catalog_lead_rows(arguments, conversation=None, estimated_price=None):
     """AI katalogidan tanlangan mahsulotlar leadga izoh sifatida yoziladi.
 
@@ -1374,6 +1492,11 @@ def ai_catalog_lead_rows(arguments, conversation=None, estimated_price=None):
             "price": str(item.price) if item else "",
         })
         asked_names.append(asked_name)
+    # Raqam narxdan ishonchli: mijoz albomdagi o'rinni ko'rsatadi, narx esa
+    # bir xil bo'lishi mumkin. Shuning uchun avval raqam bo'yicha tuzatiladi.
+    corrected = correct_lead_row_by_album_position(rows, conversation)
+    if corrected is not rows:
+        return corrected
     return correct_lead_row_by_price(rows, conversation, estimated_price, asked_names)
 
 
@@ -1744,6 +1867,9 @@ SHARED_POST_MEMORY_LIMIT = 400
 # Graph API ga chiqish javobni sekinlashtiradi va kvotani yeydi.
 OWN_MEDIA_CACHE_SECONDS = 3600
 OWN_MEDIA_CACHE_KEY = "own_media_index"
+OWN_MEDIA_LOOKUP_KEY = "own_media_lookups"
+OWN_MEDIA_LOOKUP_LIMIT = 2000
+OWN_MEDIA_FOREIGN_CACHE_SECONDS = 24 * 3600
 
 
 def shared_caption_key(caption):
@@ -1843,6 +1969,49 @@ def own_media_index(force=False):
     return cache
 
 
+def own_media_lookup(media_id):
+    """Shu media bizning profilimizdanmi — Instagram dan bevosita so'rab.
+
+    `own_media_index()` postlar ro'yxatiga tayanadi, ro'yxat esa to'liq emas.
+    Real o'lchov: jim qolgan 69 ta noyob mediadan 67 tasi rostdan begona
+    profilniki edi, 2 tasi bizniki — lekin o'sha 2 tasi 158 ta suhbatda
+    ulashilgan. Mijozlar eng ko'p yuboradigan reklama postimiz aynan shu.
+
+    Javob keshlanadi: bizniki degan javob abadiy (post egasi o'zgarmaydi),
+    begona degani bir kunga. Tarmoq xatosi umuman keshlanmaydi.
+    """
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        return {}
+    integration, extra = integration_extra()
+    cache = dict(extra.get(OWN_MEDIA_LOOKUP_KEY) or {})
+    row = cache.get(media_id)
+    now = int(timezone.now().timestamp())
+    if isinstance(row, dict):
+        if row.get("ours"):
+            return row
+        if now - int(row.get("checked_at") or 0) < OWN_MEDIA_FOREIGN_CACHE_SECONDS:
+            return row
+    from .platform_services import instagram_media_row
+
+    media, verdict = instagram_media_row(media_id)
+    if verdict == "unknown":
+        return row if isinstance(row, dict) else {}
+    result = {"ours": verdict == "ours", "checked_at": now,
+              "permalink": (media or {}).get("permalink") or "",
+              "caption": ((media or {}).get("caption") or "")[:400]}
+    if result["ours"]:
+        print(f"OWN_MEDIA_CONFIRMED media={media_id} permalink={result['permalink']}", flush=True)
+    cache[media_id] = result
+    if len(cache) > OWN_MEDIA_LOOKUP_LIMIT:
+        for key in sorted(cache, key=lambda value: int((cache[value] or {}).get("checked_at") or 0))[:len(cache) - OWN_MEDIA_LOOKUP_LIMIT]:
+            cache.pop(key, None)
+    extra[OWN_MEDIA_LOOKUP_KEY] = cache
+    integration.extra = extra
+    integration.save(update_fields=["extra", "updated_at"])
+    return result
+
+
 def ai_catalog_link_count(permalink):
     if not permalink:
         return 0
@@ -1870,6 +2039,10 @@ def own_post_permalink_for_shared_media(attachment):
     permalink = (index.get("by_media") or {}).get(media_id) if media_id else ""
     if not permalink and caption_key:
         permalink = (index.get("by_caption") or {}).get(caption_key) or ""
+    if not permalink and media_id:
+        # Ro'yxatda yo'q post ham bizniki bo'lishi mumkin: media raqamini
+        # bevosita so'rasak Instagram permalinkni o'zi qaytaradi.
+        permalink = own_media_lookup(media_id).get("permalink") or ""
     if permalink:
         print(f"SHARED_POST_RESOLVED media={media_id or '-'} permalink={permalink}", flush=True)
         # CDN ulashuvining media raqami ham eslab qolinadi: shu postning
@@ -2076,6 +2249,13 @@ def shared_media_verdict(attachment, items=None):
         key = media_url_match_key(permalink)
         index = own_media_index()
         ours = any(media_url_match_key(value) == key for value in (index.get("by_media") or {}).values())
+    if not ours:
+        # Ro'yxat to'liq emas — media raqamini Instagram dan bevosita so'raymiz.
+        # Bu profil egaligining yagona ishonchli tekshiruvi.
+        lookup = own_media_lookup((attachment or {}).get("media_id"))
+        if lookup.get("ours"):
+            ours = True
+            permalink = permalink or lookup.get("permalink") or ""
     link_attachment = dict(attachment, url=permalink) if permalink and permalink != url else attachment
     # conversation berilmaydi: suhbatdagi boshqa havolalar bu postni tizimda bor
     # qilib ko'rsatmasligi kerak.
@@ -3655,11 +3835,55 @@ def replied_to_catalog_items(conversation, reply_mid):
     return []
 
 
+REPLIED_TO_TEXT_LIMIT = 220
+
+
+def replied_to_message(conversation, reply_mid):
+    """Mijoz javob qilgan xabarning o'zi.
+
+    Har bir yuborilgan va kelgan xabar Instagram id si bilan yoziladi:
+    AI javobi `deliver_ai_reply` da, operator xabari va mijoz xabari esa
+    webhookda. Shuning uchun reply qilingan xabar matnli bo'lsa ham topiladi.
+    """
+    reply_mid = (reply_mid or "").strip()
+    if not reply_mid:
+        return None
+    return Message.objects.filter(conversation=conversation, instagram_message_id=reply_mid).order_by("-id").first()
+
+
+def replied_to_text_note(conversation, reply_mid):
+    """Matnli xabarga qilingan reply uchun izoh.
+
+    Real o'lchov: bazadagi 350 ta reply xabaridan atigi 3 tasi katalog albomiga
+    edi — 142 tasi operator matniga, 107 tasi AI matniga, 93 tasi mijozning o'z
+    xabariga. Ularning hammasi AI ga izohsiz borar edi va savol havoda qolardi:
+    suhbat 2993 da "Kami borm8" aynan 800 000 lik Jumiliaga javob edi, 2878 da
+    "Bula hammasi 200 mingku" katalog albomi haqidagi javobga.
+    """
+    message = replied_to_message(conversation, reply_mid)
+    if not message:
+        return ""
+    text = " ".join((message.text or "").split())
+    if not text:
+        return ""
+    text = text[:REPLIED_TO_TEXT_LIMIT]
+    if message.sender == "customer":
+        return (f"Tizim izohi: mijoz o'zining oldingi xabariga javob qildi — «{text}». "
+                "Yangi xabari o'sha xabarga tegishli.")
+    who = "javobimizga" if message.sender == "ai" else "operator xabariga"
+    return (f"Tizim izohi: mijoz aynan shu {who} javob qildi — «{text}». "
+            "Yangi xabarini shu gapning davomi deb tushun.")
+
+
 def replied_to_note(conversation, reply_mid):
-    """Reply qilingan mahsulotni suhbat matniga qo'shiladigan qator qilib beradi."""
+    """Reply qilingan mahsulotni suhbat matniga qo'shiladigan qator qilib beradi.
+
+    Avval katalog albomi va rasmi qaraladi — u yerda mahsulot nomi va narxi
+    aniq. Topilmasa reply qilingan xabarning o'z matni beriladi.
+    """
     rows = replied_to_catalog_items(conversation, reply_mid)
     if not rows:
-        return ""
+        return replied_to_text_note(conversation, reply_mid)
     names = []
     for row in rows[:10]:
         name = (row.get("name") or "").strip()
@@ -3668,7 +3892,7 @@ def replied_to_note(conversation, reply_mid):
         price = row.get("price")
         names.append(f"{name} — {money_uz(price)} so'm" if price else name)
     if not names:
-        return ""
+        return replied_to_text_note(conversation, reply_mid)
     if len(names) == 1:
         return f"Tizim izohi: mijoz shu mahsulot rasmiga javob qildi — {names[0]}."
     return ("Tizim izohi: mijoz shu albomga javob qildi — " + "; ".join(names) +
@@ -3710,6 +3934,15 @@ ALBUM_PRICE_GROUP_INSTRUCTION = (
 )
 
 
+ALBUM_NUMBERING_INSTRUCTION = (
+    "Raqamlar faqat SHU albomga tegishli. Bundan oldin albom yuborilgan bo'lsa "
+    "uning raqamlari endi bekor — mijozning ekranida shu albom turadi. "
+    "Mahsulotlarni sanasang yoki mijoz raqam yozsa, aynan shu albomning "
+    "items ro'yxatidagi position dan foydalan; o'zingning oldingi javobidagi "
+    "tartibni takrorlama."
+)
+
+
 def ai_catalog_album_result(result):
     """AI ga rasm havolasi berilmaydi, u URL ni matn qilib yuborib qo'ymasligi uchun.
 
@@ -3733,6 +3966,7 @@ def ai_catalog_album_result(result):
                 span = ", narxlari %s dan %s gacha" % (money_uz(prices[0]), money_uz(prices[-1]))
             trimmed["instruction_uz"] = ALBUM_PRICE_GROUP_INSTRUCTION.format(
                 count=len(rows), prices=span)
+        trimmed["instruction_uz"] += " " + ALBUM_NUMBERING_INSTRUCTION
     return trimmed
 
 
@@ -4388,6 +4622,7 @@ def ai_follow_up_decision(conversation, expected_ai_message):
         "Javob faqat JSON schema bo‘yicha bo‘lsin."
     )
     client = OpenAI(api_key=api_key)
+    reply_script = conversation_reply_script(conversation)
     response = client.responses.create(
         model=ai_settings.openai_model or settings.OPENAI_MODEL,
         instructions=instructions,

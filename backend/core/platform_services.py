@@ -135,6 +135,49 @@ def instagram_recent_media(account_id=None):
     return rows
 
 
+def instagram_media_row(media_id, account_id=None):
+    """Media raqami bo'yicha postni Instagram dan so'raydi.
+
+    Graph API faqat o'z akkauntimizning mediasini beradi, shuning uchun javob
+    kelishining o'zi "bu post bizning profilimizdan" degani. Ro'yxat
+    (`/media` chekkasi) esa hamma postni bermaydi: real o'lchov — profilda
+    151 post bor, ro'yxat 178 qator qaytardi, lekin mijozlar eng ko'p
+    ulashadigan `DIlfKrugybL` (136 suhbat) va `DXL_kLeALd0` (23 suhbat) o'sha
+    ro'yxatda yo'q. Ikkalasi ham shu funksiyada 200 bilan topiladi.
+
+    (row, "ours"|"foreign"|"unknown") qaytaradi. "unknown" — tarmoq yoki token
+    xatosi: bunda post begona deb hisoblanmaydi.
+    """
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        return None, "unknown"
+    accounts = instagram_lookup_accounts(account_id)
+    if not accounts:
+        return None, "unknown"
+    verdict = "unknown"
+    for account, access_token in accounts:
+        if outbound_blocked():
+            return None, "unknown"
+        url = f"https://graph.instagram.com/{settings.INSTAGRAM_API_VERSION}/{media_id}"
+        try:
+            response = requests.get(url, params={"access_token": access_token, "fields": "id,caption,media_type,media_url,permalink,timestamp,thumbnail_url"}, timeout=20)
+        except Exception as error:
+            print(f"INSTAGRAM_MEDIA_ROW_FAILED media={media_id} account={account} error={error}", flush=True)
+            continue
+        if response.status_code == 200:
+            try:
+                return response.json(), "ours"
+            except ValueError:
+                continue
+        # 400 "does not exist, cannot be loaded due to missing permissions" —
+        # boshqa profilning posti. 5xx esa bizning xabarimiz emas.
+        if response.status_code in (400, 404):
+            verdict = "foreign"
+            continue
+        print(f"INSTAGRAM_MEDIA_ROW_STATUS media={media_id} account={account} status={response.status_code}", flush=True)
+    return None, verdict
+
+
 def find_active_story_by_permalink(permalink, account_id=None):
     normalized = normalize_instagram_permalink(permalink)
     if not normalized:

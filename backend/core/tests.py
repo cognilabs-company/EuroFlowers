@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import zipfile
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models import F
@@ -12613,3 +12614,358 @@ class TheMonthRangeHelperTests(TestCase):
         self.assertEqual((last + timedelta(days=1)).day, 1)
         self.assertLessEqual(first, today)
         self.assertGreaterEqual(last, today)
+
+
+class AReplyToAnyMessageIsUnderstoodTests(TestCase):
+    """Mijoz reply qilsa AI qaysi xabar haqida ekanini biladi.
+
+    Bazadagi o'lchov: 350 ta reply xabaridan atigi 3 tasi katalog albomiga edi.
+    142 tasi operator matniga, 107 tasi AI matniga, 93 tasi mijozning o'z
+    xabariga qilingan va hammasi izohsiz AI ga borgan. Suhbat 2993 da
+    "Kami borm8" aynan 800 000 lik Jumiliaga javob edi.
+    """
+
+    def setUp(self):
+        self.customer = Customer.objects.create(instagram_user_id="ig-reply-any")
+        self.conversation = Conversation.objects.create(customer=self.customer)
+
+    def test_a_reply_to_our_ai_answer_names_that_answer(self):
+        from .services import replied_to_note
+
+        self.conversation.messages.create(
+            sender="ai", text="Jumilia Kompozitsiyasi — 800 000 so'm. Qachonga kerak edi?",
+            instagram_message_id="mid-ai-1")
+        note = replied_to_note(self.conversation, "mid-ai-1")
+        self.assertIn("javobimizga", note)
+        self.assertIn("Jumilia Kompozitsiyasi", note)
+
+    def test_a_reply_to_an_operator_message_names_that_message(self):
+        from .services import replied_to_note
+
+        self.conversation.messages.create(
+            sender="operator", text="Тошкент шахар яккасарой тумани бобур кочаси 10",
+            instagram_message_id="mid-op-1")
+        note = replied_to_note(self.conversation, "mid-op-1")
+        self.assertIn("operator xabariga", note)
+        self.assertIn("бобур кочаси", note)
+
+    def test_a_reply_to_the_customers_own_message_points_back_at_it(self):
+        from .services import replied_to_note
+
+        self.conversation.messages.create(
+            sender="customer", text="Mijoz Instagram post/reelni directga yubordi.",
+            instagram_message_id="mid-cust-1")
+        note = replied_to_note(self.conversation, "mid-cust-1")
+        self.assertIn("o'zining oldingi xabariga", note)
+
+    def test_a_long_message_is_cut_but_still_readable(self):
+        from .services import REPLIED_TO_TEXT_LIMIT, replied_to_note
+
+        self.conversation.messages.create(sender="ai", text="A" * 600, instagram_message_id="mid-long")
+        note = replied_to_note(self.conversation, "mid-long")
+        self.assertIn("A" * 50, note)
+        self.assertLess(len(note), REPLIED_TO_TEXT_LIMIT + 200)
+
+    def test_a_reply_to_a_catalog_album_still_names_the_product(self):
+        from .services import replied_to_note
+
+        item = AICatalogItem.objects.create(name="Katalina", arrangement_type="bouquet",
+                                            price=199000, quantity=1,
+                                            image_url="https://cdn.example.com/k.jpg")
+        self.conversation.messages.create(sender="system", text="", metadata={
+            "catalog_album_result": {"ok": True, "items": [
+                {"position": 1, "catalog_id": item.id, "name": "Katalina", "price": "199000.00", "delivered": True}],
+                "sent_message_ids": ["mid-album"],
+                "sent_groups": [{"message_id": "mid-album", "catalog_ids": [item.id]}]}})
+        note = replied_to_note(self.conversation, "mid-album")
+        self.assertIn("Katalina", note)
+        self.assertIn("mahsulot rasmiga", note)
+
+    def test_a_reply_to_nothing_we_know_adds_no_note(self):
+        from .services import replied_to_note
+
+        self.assertEqual(replied_to_note(self.conversation, "mid-unknown"), "")
+        self.assertEqual(replied_to_note(self.conversation, ""), "")
+
+    def test_an_empty_message_adds_no_note(self):
+        from .services import replied_to_note
+
+        self.conversation.messages.create(sender="ai", text="   ", instagram_message_id="mid-blank")
+        self.assertEqual(replied_to_note(self.conversation, "mid-blank"), "")
+
+
+class OnlyTheLastAlbumNumbersCountTests(TestCase):
+    """Ikki albom ketsa mijozning raqami oxirgi albomga tegishli.
+
+    Real suhbat 3051 (@kdyrv.m, lead #225): reklama rasmiga bitta albom ketdi
+    (1 Alfalob, 2 Jumila), o'n sakkiz soniyadan keyin reel bo'yicha to'qqiz
+    rasmli ikkinchi albom ketdi (1 Jumila, 2 Alfalob). AI javobida birinchi
+    albomning tartibini yozdi, mijoz "2" deb tanladi va leadga Alfalob o'rniga
+    Jumila tushdi. Ikkalasining narxi 199 000 bo'lgani uchun narx tuzatgichi
+    buni ushlay olmadi.
+    """
+
+    def setUp(self):
+        self.jumila = AICatalogItem.objects.create(
+            name="Buket Jumila Va Oq Atir Guldan Yasalgan Kompazitsia",
+            arrangement_type="bouquet", price=199000, quantity=1,
+            image_url="https://cdn.example.com/jumila.jpg")
+        self.alfalob = AICatalogItem.objects.create(
+            name="Buket Alfalob Gulidan Kompazitsia", arrangement_type="bouquet",
+            price=199000, quantity=1, image_url="https://cdn.example.com/alfalob.jpg")
+        self.customer = Customer.objects.create(instagram_user_id="ig-album-order")
+        self.conversation = Conversation.objects.create(customer=self.customer)
+
+    def _album(self, order):
+        rows = []
+        for position, item in enumerate(order, start=1):
+            rows.append({"position": position, "catalog_id": item.id, "name": item.name,
+                         "price": str(item.price), "delivered": True})
+        return self.conversation.messages.create(sender="system", text="", metadata={
+            "catalog_album_result": {"ok": True, "items": rows}})
+
+    def test_the_number_comes_from_the_newest_album(self):
+        from .services import ai_catalog_lead_rows
+
+        self._album([self.alfalob, self.jumila])
+        self._album([self.jumila, self.alfalob])
+        self.conversation.messages.create(sender="customer", text="2")
+        rows = ai_catalog_lead_rows(
+            {"catalog_items": [{"catalog_id": self.jumila.id, "catalog_name": self.jumila.name, "quantity": 1}]},
+            conversation=self.conversation, estimated_price="199000.00")
+        self.assertEqual(rows[0]["ai_catalog_item"], self.alfalob.id)
+        self.assertEqual(rows[0]["catalog_name"], self.alfalob.name)
+
+    def test_one_album_alone_is_never_corrected(self):
+        from .services import ai_catalog_lead_rows
+
+        self._album([self.jumila, self.alfalob])
+        self.conversation.messages.create(sender="customer", text="2")
+        rows = ai_catalog_lead_rows(
+            {"catalog_items": [{"catalog_id": self.jumila.id, "catalog_name": self.jumila.name, "quantity": 1}]},
+            conversation=self.conversation, estimated_price="199000.00")
+        self.assertEqual(rows[0]["ai_catalog_item"], self.jumila.id)
+
+    def test_a_number_that_matches_the_new_album_too_changes_nothing(self):
+        from .services import ai_catalog_lead_rows
+
+        self._album([self.alfalob, self.jumila])
+        self._album([self.alfalob, self.jumila])
+        self.conversation.messages.create(sender="customer", text="2")
+        rows = ai_catalog_lead_rows(
+            {"catalog_items": [{"catalog_id": self.jumila.id, "catalog_name": self.jumila.name, "quantity": 1}]},
+            conversation=self.conversation, estimated_price="199000.00")
+        self.assertEqual(rows[0]["ai_catalog_item"], self.jumila.id)
+
+    def test_a_phone_number_is_not_read_as_a_choice(self):
+        from .services import album_position_maps, customer_album_choice
+
+        self._album([self.alfalob, self.jumila])
+        self._album([self.jumila, self.alfalob])
+        self.conversation.messages.create(sender="customer", text="+998993159713")
+        maps = album_position_maps(self.conversation)
+        self.assertIsNone(customer_album_choice(self.conversation, maps[-1]))
+
+    def test_a_number_outside_the_album_is_not_a_choice(self):
+        from .services import album_position_maps, customer_album_choice
+
+        self._album([self.alfalob, self.jumila])
+        self._album([self.jumila, self.alfalob])
+        self.conversation.messages.create(sender="customer", text="7")
+        maps = album_position_maps(self.conversation)
+        self.assertIsNone(customer_album_choice(self.conversation, maps[-1]))
+
+    def test_a_number_written_with_a_suffix_still_counts(self):
+        from .services import album_position_maps, customer_album_choice
+
+        self._album([self.alfalob, self.jumila])
+        album = album_position_maps(self.conversation)[-1]
+        for text in ["2 chi", "2-chi", "2 ni", "2chisi", "2."]:
+            Message.objects.filter(conversation=self.conversation, sender="customer").delete()
+            self.conversation.messages.create(sender="customer", text=text)
+            self.assertEqual(customer_album_choice(self.conversation, album), 2, text)
+
+    def test_a_number_typed_before_the_album_is_ignored(self):
+        from .services import album_position_maps, customer_album_choice
+
+        self.conversation.messages.create(sender="customer", text="2")
+        self._album([self.alfalob, self.jumila])
+        maps = album_position_maps(self.conversation)
+        self.assertIsNone(customer_album_choice(self.conversation, maps[-1]))
+
+    def test_the_model_is_told_which_item_the_number_means(self):
+        from .services import conversation_state_for_ai
+
+        self._album([self.alfalob, self.jumila])
+        self._album([self.jumila, self.alfalob])
+        self.conversation.messages.create(sender="customer", text="2")
+        settings_row, _ = BusinessSettings.objects.get_or_create(pk=1)
+        state = conversation_state_for_ai(self.conversation, settings_row, [])
+        self.assertTrue(state["already_sent"]["older_album_numbers_void"])
+        self.assertEqual(state["already_sent"]["albums_sent"], 2)
+        self.assertEqual(state["album_choice"]["catalog_id"], self.alfalob.id)
+        self.assertEqual(state["album_choice"]["position"], 2)
+
+    def test_the_album_result_says_older_numbers_are_void(self):
+        from .services import ALBUM_NUMBERING_INSTRUCTION, ai_catalog_album_result
+
+        trimmed = ai_catalog_album_result({"ok": True, "whole_catalog": False, "items": [
+            {"position": 1, "catalog_id": self.jumila.id, "name": self.jumila.name,
+             "price": "199000.00", "delivered": True, "image_url": "https://cdn.example.com/j.jpg"}]})
+        self.assertIn(ALBUM_NUMBERING_INSTRUCTION, trimmed["instruction_uz"])
+        self.assertNotIn("image_url", trimmed["items"][0])
+
+
+class OurOwnPostIsFoundEvenWhenTheListingMissesItTests(TestCase):
+    """Ulashilgan post bizning profilimizdanmi — media raqami bilan aniqlanadi.
+
+    Produksiya o'lchovi: jim qolgan 69 ta noyob mediadan 67 tasi rostdan begona
+    profilniki, 2 tasi bizniki edi. O'sha 2 tasi 158 ta suhbatda ulashilgan —
+    `DIlfKrugybL` 136 marta, `DXL_kLeALd0` 23 marta. Ikkalasi ham
+    `/media` ro'yxatida yo'q, lekin media raqami bo'yicha so'rovga Instagram
+    200 qaytaradi.
+    """
+
+    OURS_ID = "18130428799414577"
+    OURS_PERMALINK = "https://www.instagram.com/p/DIlfKrugybL/"
+    FOREIGN_ID = "17991203555844776"
+    CDN = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=18130428799414577&signature=Ab3A"
+
+    def setUp(self):
+        IntegrationSettings.objects.filter(pk=1).delete()
+        IntegrationSettings.objects.create(pk=1)
+        self.customer = Customer.objects.create(instagram_user_id="ig-own-media")
+        self.conversation = Conversation.objects.create(customer=self.customer)
+
+    def _attachment(self, url, media_id):
+        return {"kind": "post", "url": url, "caption": "", "media_id": media_id}
+
+    def test_our_post_is_recognised_by_its_media_id(self):
+        from .services import shared_media_verdict
+
+        with patch("core.platform_services.instagram_media_row",
+                   return_value=({"id": self.OURS_ID, "permalink": self.OURS_PERMALINK}, "ours")):
+            verdict = shared_media_verdict(self._attachment(self.CDN, self.OURS_ID), items=[])
+        self.assertTrue(verdict["ours"])
+        self.assertEqual(verdict["permalink"], self.OURS_PERMALINK)
+
+    def test_our_post_is_answered_and_not_silenced(self):
+        from .services import shared_link_is_in_the_system, unlinked_shared_media_silence
+
+        self.conversation.messages.create(sender="customer", text="Shundan bormi", metadata={
+            "attachments": [self._attachment(self.CDN, self.OURS_ID)]})
+        with patch("core.platform_services.instagram_media_row",
+                   return_value=({"id": self.OURS_ID, "permalink": self.OURS_PERMALINK}, "ours")):
+            self.assertTrue(shared_link_is_in_the_system(self._attachment(self.CDN, self.OURS_ID), items=[]))
+            self.assertFalse(unlinked_shared_media_silence(self.conversation))
+
+    def test_another_profiles_reel_stays_completely_ignored(self):
+        from .services import shared_link_is_in_the_system, unlinked_shared_media_silence
+
+        attachment = self._attachment("https://www.instagram.com/reel/Dc-Y3nct0fJ/", self.FOREIGN_ID)
+        self.conversation.messages.create(sender="customer", text="Shunaqasi bormi", metadata={
+            "attachments": [attachment]})
+        with patch("core.platform_services.instagram_media_row", return_value=(None, "foreign")):
+            self.assertFalse(shared_link_is_in_the_system(attachment, items=[]))
+            self.assertTrue(unlinked_shared_media_silence(self.conversation))
+
+    def test_a_network_error_never_turns_a_foreign_post_into_ours(self):
+        from .services import shared_media_verdict
+
+        attachment = self._attachment("https://www.instagram.com/reel/Dc-Y3nct0fJ/", self.FOREIGN_ID)
+        with patch("core.platform_services.instagram_media_row", return_value=(None, "unknown")):
+            self.assertFalse(shared_media_verdict(attachment, items=[])["ours"])
+
+    def test_the_answer_is_asked_once_and_then_cached(self):
+        from .services import own_media_lookup
+
+        with patch("core.platform_services.instagram_media_row",
+                   return_value=({"id": self.OURS_ID, "permalink": self.OURS_PERMALINK}, "ours")) as asked:
+            self.assertTrue(own_media_lookup(self.OURS_ID)["ours"])
+            self.assertTrue(own_media_lookup(self.OURS_ID)["ours"])
+        self.assertEqual(asked.call_count, 1)
+
+    def test_a_network_error_is_not_cached(self):
+        from .services import own_media_lookup
+
+        with patch("core.platform_services.instagram_media_row", return_value=(None, "unknown")) as asked:
+            self.assertEqual(own_media_lookup(self.OURS_ID), {})
+            self.assertEqual(own_media_lookup(self.OURS_ID), {})
+        self.assertEqual(asked.call_count, 2)
+
+    def test_no_media_id_asks_nothing(self):
+        from .services import own_media_lookup
+
+        with patch("core.platform_services.instagram_media_row") as asked:
+            self.assertEqual(own_media_lookup(""), {})
+            self.assertEqual(own_media_lookup(None), {})
+        asked.assert_not_called()
+
+    def test_the_lookup_never_leaves_the_process_in_tests(self):
+        from .platform_services import instagram_media_row
+
+        row, verdict = instagram_media_row(self.OURS_ID)
+        self.assertIsNone(row)
+        self.assertEqual(verdict, "unknown")
+
+    def test_the_permalink_is_resolved_from_the_media_id(self):
+        from .services import own_post_permalink_for_shared_media
+
+        with patch("core.platform_services.instagram_media_row",
+                   return_value=({"id": self.OURS_ID, "permalink": self.OURS_PERMALINK}, "ours")):
+            self.assertEqual(
+                own_post_permalink_for_shared_media(self._attachment(self.CDN, self.OURS_ID)),
+                self.OURS_PERMALINK)
+
+
+class TheFollowUpDecisionDoesNotCrashTests(TestCase):
+    """Follow up qarori NameError bilan yiqilmaydi.
+
+    Produksiyada 72 soatda 209 marta `NameError: name 'reply_script' is not
+    defined` chiqdi va bazada bitta ham follow up xabari yo'q edi — 2 526 ta
+    AI javobiga qarshi nol. Crash OpenAI chaqiruvidan keyin bo'lgani uchun
+    token har safar sarflanib javob tashlab yuborilgan.
+    """
+
+    def setUp(self):
+        self.customer = Customer.objects.create(instagram_user_id="ig-follow-up", name="Mirkamol")
+        self.conversation = Conversation.objects.create(customer=self.customer)
+        self.conversation.messages.create(sender="customer", text="Assalomu alaykum")
+        self.reply = self.conversation.messages.create(sender="ai", text="Qanday gul kerak edi?")
+        AISettings.objects.filter(pk=1).delete()
+        AISettings.objects.create(pk=1, system_prompt="test")
+
+    def _decide(self, payload):
+        response = SimpleNamespace(output_text=json.dumps(payload), status="completed")
+        client = MagicMock()
+        client.responses.create.return_value = response
+        with patch("core.services.OpenAI", return_value=client), \
+                patch("core.services.openai_api_key", return_value="sk-test"):
+            from .services import ai_follow_up_decision
+
+            return ai_follow_up_decision(self.conversation, self.reply)
+
+    def test_a_follow_up_decision_comes_back(self):
+        data = self._decide({"send_follow_up": True, "message": "Qanaqa gul yoqdi?", "reason": "jim"})
+        self.assertTrue(data["send_follow_up"])
+        self.assertEqual(data["message"], "Qanaqa gul yoqdi?")
+
+    def test_an_uzbek_conversation_sets_the_customer_language(self):
+        self.conversation.messages.create(sender="customer", text="Ассалому алейкум яхшимисиз")
+        self._decide({"send_follow_up": True, "message": "Қанақа гул керак эди?", "reason": "жим"})
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.language, "uz")
+
+    def test_a_russian_conversation_sets_the_customer_language(self):
+        self.conversation.messages.create(sender="customer", text="Здравствуйте, можно заказать букет?")
+        self._decide({"send_follow_up": True, "message": "Какие цветы вам нужны?", "reason": "тихо"})
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.language, "ru")
+
+    def test_no_follow_up_leaves_the_language_alone(self):
+        self.customer.language = "ru"
+        self.customer.save(update_fields=["language"])
+        self.conversation.messages.create(sender="customer", text="Ассалому алейкум")
+        self._decide({"send_follow_up": False, "message": None, "reason": "lead bor"})
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.language, "ru")
