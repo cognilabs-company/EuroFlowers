@@ -4221,6 +4221,42 @@ class ApiTests(TestCase):
         self.assertEqual(response.status_code, 201, response.json())
         self.assertEqual(Decimal(response.json()["florist_salary_amount"]), Decimal("125000.00"))
 
+    def test_standard_box_catalog_takes_manual_florist_fee(self):
+        profile = self._florist_with_rates("fl-fee-box-1")
+        self.client.post("/api/florist-stock-issues/issue/", {"florist": profile.id, "batch": self.batch.id, "quantity_stems": 30}, format="json")
+        response = self.client.post("/api/catalog/", {
+            "name_uz": "Quti katalog", "arrangement_type": "box",
+            "florist": profile.id, "price": "500000", "quantity_total": 1,
+            "florist_salary_amount": "125000",
+            "composition": [{"stock_batch": self.batch.id, "quantity_stems": 10}],
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.json())
+        self.assertEqual(Decimal(response.json()["florist_salary_amount"]), Decimal("125000.00"))
+        self.assertTrue(FloristSalaryEntry.objects.filter(florist=profile, amount=Decimal("125000.00")).exists())
+
+    def test_standard_box_catalog_needs_manual_florist_fee(self):
+        profile = self._florist_with_rates("fl-fee-box-2")
+        self.client.post("/api/florist-stock-issues/issue/", {"florist": profile.id, "batch": self.batch.id, "quantity_stems": 30}, format="json")
+        response = self.client.post("/api/catalog/", {
+            "name_uz": "Quti katalog", "arrangement_type": "box",
+            "florist": profile.id, "price": "500000", "quantity_total": 1,
+            "composition": [{"stock_batch": self.batch.id, "quantity_stems": 10}],
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Quti uchun floristga beriladigan pulni kiriting", str(response.data))
+
+    def test_standard_box_catalog_needs_explicit_flower_count(self):
+        profile = self._florist_with_rates("fl-fee-box-3")
+        self.client.post("/api/florist-stock-issues/issue/", {"florist": profile.id, "batch": self.batch.id, "quantity_stems": 30}, format="json")
+        response = self.client.post("/api/catalog/", {
+            "name_uz": "Quti katalog", "arrangement_type": "box",
+            "florist": profile.id, "price": "500000", "quantity_total": 1,
+            "florist_salary_amount": "125000",
+            "composition": [{"stock_batch": self.batch.id}],
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Quti katalogida har bir gul sonini kiriting", str(response.data))
+
     def test_florist_issue_can_be_edited(self):
         user = User.objects.create_user("fl-issue-edit", password="p")
         profile = FloristProfile.objects.create(user=user, staff_type="florist")

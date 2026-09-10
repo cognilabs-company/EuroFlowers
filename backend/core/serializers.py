@@ -1414,25 +1414,21 @@ def merge_catalog_item_payloads(items):
 
 
 def apply_volume_rate_to_attrs(attrs, initial_data=None, default_kind="standard"):
-    """Florist haqini hajm tarifidan oladi.
-
-    Standart katalogda qo'lda kiritilgan summa qabul qilinmaydi — haq faqat
-    floristga belgilangan hajm tarifi bo'yicha beriladi. Custom katalogda esa
-    ish hajmi oldindan noma'lum, shuning uchun qo'lda kiritish qoladi.
-    """
     data = initial_data or {}
     kind = attrs.get("catalog_kind") or data.get("catalog_kind") or default_kind
-    if kind == "standard":
-        attrs.pop("florist_salary_amount", None)
-    elif "florist_salary_amount" in attrs or "florist_salary_amount" in data:
-        return attrs
-    arrangement_type = attrs.get("arrangement_type")
-    volume = attrs.get("volume")
+    arrangement_type = attrs.get("arrangement_type") or data.get("arrangement_type")
     florist = attrs.get("florist")
     if florist and florist.staff_type != "florist":
         attrs["florist_salary_amount"] = Decimal("0")
         attrs.pop("_volume_default_stems", None)
         return attrs
+    if kind == "standard" and arrangement_type == "box":
+        return attrs
+    if kind == "standard":
+        attrs.pop("florist_salary_amount", None)
+    elif "florist_salary_amount" in attrs or "florist_salary_amount" in data:
+        return attrs
+    volume = attrs.get("volume")
     if arrangement_type and volume and florist:
         rate = FloristVolumeRate.objects.filter(florist=florist, arrangement_type=arrangement_type, volume=volume, is_active=True).first()
         if rate:
@@ -2003,23 +1999,32 @@ class CatalogItemSerializer(serializers.ModelSerializer):
             materials = normalize_catalog_material_rows(materials)
         florist_value = attrs.get("florist", getattr(self.instance, "florist", None))
         kind = attrs.get("catalog_kind") or getattr(self.instance, "catalog_kind", None) or "standard"
+        arrangement_type = attrs.get("arrangement_type") or getattr(self.instance, "arrangement_type", None)
+        volume = attrs.get("volume") or getattr(self.instance, "volume", None)
+        is_standard_box = kind == "standard" and arrangement_type == "box"
         stock_florist = florist_value if kind != "custom" else None
         if florist_value and not self.instance:
-            if not attrs.get("arrangement_type"):
+            if not arrangement_type:
                 raise serializers.ValidationError({"arrangement_type": "Florist katalogida turini tanlash kerak"})
-            if not (attrs.get("volume") or "").strip():
+            if not is_standard_box and not (volume or "").strip():
                 raise serializers.ValidationError({"volume": "Florist katalogida hajmni tanlash kerak — gul shu bo‘yicha taqsimlanadi"})
             if not composition:
                 raise serializers.ValidationError({"composition": "Floristga chiqarilgan qaysi guldan yasalganini tanlang"})
         if kind == "standard" and florist_value and florist_value.staff_type == "florist":
-            arrangement_type = attrs.get("arrangement_type") or getattr(self.instance, "arrangement_type", None)
-            volume = attrs.get("volume") or getattr(self.instance, "volume", None)
-            if arrangement_type and volume and not FloristVolumeRate.objects.filter(
+            if is_standard_box:
+                salary = attrs.get("florist_salary_amount", getattr(self.instance, "florist_salary_amount", None))
+                if not salary or Decimal(salary) <= 0:
+                    raise serializers.ValidationError({"florist_salary_amount": "Quti uchun floristga beriladigan pulni kiriting"})
+            elif arrangement_type and volume and not FloristVolumeRate.objects.filter(
                 florist=florist_value, arrangement_type=arrangement_type, volume=volume, is_active=True,
             ).exists():
                 raise serializers.ValidationError({
                     "volume": f"{florist_value} uchun bu hajm tarifi belgilanmagan. Avval floristga hajm narxini kiriting.",
                 })
+        if composition and is_standard_box:
+            for row in composition:
+                if int(row.get("quantity_stems") or 0) < 1:
+                    raise serializers.ValidationError({"composition": "Quti katalogida har bir gul sonini kiriting"})
         if composition and not stock_florist:
             for row in composition:
                 if int(row.get("quantity_stems") or 0) < 1:
@@ -2116,7 +2121,9 @@ class CatalogItemSerializer(serializers.ModelSerializer):
             composition = normalize_catalog_composition_rows(composition)
         if materials is not None:
             materials = normalize_catalog_material_rows(materials)
-        validated_data = apply_volume_rate_to_attrs(validated_data, getattr(self, "initial_data", {}), instance.catalog_kind)
+        initial_data = dict(getattr(self, "initial_data", {}) or {})
+        initial_data.setdefault("arrangement_type", instance.arrangement_type)
+        validated_data = apply_volume_rate_to_attrs(validated_data, initial_data, instance.catalog_kind)
         validated_data = self._sync_social_post_image_data(validated_data)
         user = getattr(self.context.get("request"), "user", None)
         old_quantity_total = instance.quantity_total
