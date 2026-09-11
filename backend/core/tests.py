@@ -6285,7 +6285,7 @@ class SaleGroupMessageTests(TestCase):
         self.assertEqual(sender.call_args[0][1], "-900900")
 
     @override_settings(SALE_TELEGRAM_BOT_TOKEN="env-token", SALE_TELEGRAM_GROUP_CHAT_ID="-5409867283")
-    def test_sale_group_env_overrides_branch_and_db_settings(self):
+    def test_branch_sale_group_overrides_env_and_db_settings(self):
         from unittest.mock import patch
         self._configure_group()
         branch = Branch.objects.create(name="Parkent", sale_bot_token="parkent-token", sale_group_chat_id="-900900")
@@ -6296,8 +6296,8 @@ class SaleGroupMessageTests(TestCase):
             from .inventory_services import notify_sale_to_group
             history = CatalogHistory.objects.filter(catalog_item=item, action="sold").first()
             notify_sale_to_group(item, history, "cash")
-        self.assertEqual(sender.call_args[0][0], "env-token")
-        self.assertEqual(sender.call_args[0][1], "-5409867283")
+        self.assertEqual(sender.call_args[0][0], "parkent-token")
+        self.assertEqual(sender.call_args[0][1], "-900900")
 
     def test_branch_without_group_sends_nothing(self):
         from unittest.mock import patch

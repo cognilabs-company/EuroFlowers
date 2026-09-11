@@ -2418,10 +2418,6 @@ def sale_group_target(item):
     from .models import IntegrationSettings
     from django.conf import settings
 
-    env_token = (settings.SALE_TELEGRAM_BOT_TOKEN or "").strip()
-    env_chat_id = (settings.SALE_TELEGRAM_GROUP_CHAT_ID or "").strip()
-    if env_token and env_chat_id:
-        return env_token, env_chat_id
     if item.branch_id:
         branch = item.branch
         branch_token = (branch.sale_bot_token or "").strip()
@@ -2429,6 +2425,10 @@ def sale_group_target(item):
         if branch_token and branch_chat_id:
             return branch_token, branch_chat_id
         return "", ""
+    env_token = (settings.SALE_TELEGRAM_BOT_TOKEN or "").strip()
+    env_chat_id = (settings.SALE_TELEGRAM_GROUP_CHAT_ID or "").strip()
+    if env_token and env_chat_id:
+        return env_token, env_chat_id
     integration, _ = IntegrationSettings.objects.get_or_create(pk=1)
     return (integration.sale_bot_token or "").strip(), (integration.sale_group_chat_id or "").strip()
 
