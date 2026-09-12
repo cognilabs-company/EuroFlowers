@@ -522,7 +522,7 @@ class FloristPayment(TimeStampedModel):
 
 
 class FloristVolumeRate(TimeStampedModel):
-    ARRANGEMENT_CHOICES = [("bouquet", "Buket"), ("basket", "Savat")]
+    ARRANGEMENT_CHOICES = [("bouquet", "Buket"), ("basket", "Savat"), ("box", "Quti")]
     florist = models.ForeignKey(FloristProfile, null=True, blank=True, on_delete=models.CASCADE, related_name="volume_rates")
     arrangement_type = models.CharField(max_length=20, choices=ARRANGEMENT_CHOICES)
     volume = models.CharField(max_length=80)

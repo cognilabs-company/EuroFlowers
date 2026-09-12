@@ -1422,8 +1422,6 @@ def apply_volume_rate_to_attrs(attrs, initial_data=None, default_kind="standard"
         attrs["florist_salary_amount"] = Decimal("0")
         attrs.pop("_volume_default_stems", None)
         return attrs
-    if kind == "standard" and arrangement_type == "box":
-        return attrs
     if kind == "standard":
         attrs.pop("florist_salary_amount", None)
     elif "florist_salary_amount" in attrs or "florist_salary_amount" in data:
@@ -2001,30 +1999,21 @@ class CatalogItemSerializer(serializers.ModelSerializer):
         kind = attrs.get("catalog_kind") or getattr(self.instance, "catalog_kind", None) or "standard"
         arrangement_type = attrs.get("arrangement_type") or getattr(self.instance, "arrangement_type", None)
         volume = attrs.get("volume") or getattr(self.instance, "volume", None)
-        is_standard_box = kind == "standard" and arrangement_type == "box"
         stock_florist = florist_value if kind != "custom" else None
         if florist_value and not self.instance:
             if not arrangement_type:
                 raise serializers.ValidationError({"arrangement_type": "Florist katalogida turini tanlash kerak"})
-            if not is_standard_box and not (volume or "").strip():
+            if not (volume or "").strip():
                 raise serializers.ValidationError({"volume": "Florist katalogida hajmni tanlash kerak — gul shu bo‘yicha taqsimlanadi"})
             if not composition:
                 raise serializers.ValidationError({"composition": "Floristga chiqarilgan qaysi guldan yasalganini tanlang"})
         if kind == "standard" and florist_value and florist_value.staff_type == "florist":
-            if is_standard_box:
-                salary = attrs.get("florist_salary_amount", getattr(self.instance, "florist_salary_amount", None))
-                if not salary or Decimal(salary) <= 0:
-                    raise serializers.ValidationError({"florist_salary_amount": "Quti uchun floristga beriladigan pulni kiriting"})
-            elif arrangement_type and volume and not FloristVolumeRate.objects.filter(
+            if arrangement_type and volume and not FloristVolumeRate.objects.filter(
                 florist=florist_value, arrangement_type=arrangement_type, volume=volume, is_active=True,
             ).exists():
                 raise serializers.ValidationError({
                     "volume": f"{florist_value} uchun bu hajm tarifi belgilanmagan. Avval floristga hajm narxini kiriting.",
                 })
-        if composition and is_standard_box:
-            for row in composition:
-                if int(row.get("quantity_stems") or 0) < 1:
-                    raise serializers.ValidationError({"composition": "Quti katalogida har bir gul sonini kiriting"})
         if composition and not stock_florist:
             for row in composition:
                 if int(row.get("quantity_stems") or 0) < 1:
