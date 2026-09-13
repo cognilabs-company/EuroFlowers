@@ -485,6 +485,7 @@ class FloristSalaryEntry(TimeStampedModel):
     SOURCE_CHOICES = [("catalog", "Katalog"), ("custom_catalog", "Custom katalog"), ("decoration", "Oformleniya"), ("sale_decoration", "Sotuv oformleniya"), ("extra_decoration", "Qo‘shimcha oformleniya"), ("daily", "Kunlik"), ("rework", "Restavratsiya"), ("manual", "Qo‘lda")]
     # Oformleniya jamiga tushadigan manbalar. Hisobotda uchalasi bitta ustunga yig'iladi.
     DECORATION_SOURCES = ["decoration", "sale_decoration", "extra_decoration"]
+    PRODUCTION_SOURCES = ["catalog", "custom_catalog"]
     florist = models.ForeignKey(FloristProfile, on_delete=models.CASCADE, related_name="salary_entries")
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     # Qo'shimcha oformleniyada nechta qilingani va bittasining narxi. Summa
@@ -496,6 +497,10 @@ class FloristSalaryEntry(TimeStampedModel):
     catalog_item = models.ForeignKey("CatalogItem", null=True, blank=True, on_delete=models.SET_NULL, related_name="salary_entries")
     attendance = models.ForeignKey(FloristAttendance, null=True, blank=True, on_delete=models.SET_NULL, related_name="salary_entries")
     rework = models.ForeignKey("CatalogRework", null=True, blank=True, on_delete=models.SET_NULL, related_name="salary_entries")
+    catalog_name = models.CharField(max_length=180, blank=True)
+    catalog_kind = models.CharField(max_length=20, blank=True)
+    arrangement_type = models.CharField(max_length=20, blank=True)
+    volume = models.CharField(max_length=80, blank=True)
     note = models.TextField(blank=True)
     created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_salary_entries")
 

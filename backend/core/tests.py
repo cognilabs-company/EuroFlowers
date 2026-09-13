@@ -640,6 +640,11 @@ class BusinessRulesTests(TestCase):
         self.assertEqual(item.discount_percent, Decimal("32.43"))
         salary = FloristSalaryEntry.objects.get(catalog_item=item)
         self.assertEqual(salary.amount, Decimal("70000.00"))
+        self.assertEqual(salary.quantity, 1)
+        self.assertEqual(salary.unit_amount, Decimal("70000.00"))
+        self.assertEqual(salary.catalog_name, "Custom buket")
+        self.assertEqual(salary.catalog_kind, "custom")
+        self.assertEqual(salary.arrangement_type, "bouquet")
         self.assertEqual(salary.florist, florist)
         self.assertFalse(CatalogHistory.objects.filter(catalog_item=item, action="sold").exists())
 
@@ -712,6 +717,9 @@ class BusinessRulesTests(TestCase):
         self.assertEqual(item.calculated_component_price, Decimal("380000.00"))
         salary = FloristSalaryEntry.objects.get(catalog_item=item)
         self.assertEqual(salary.amount, Decimal("125000.00"))
+        self.assertEqual(salary.quantity, 1)
+        self.assertEqual(salary.unit_amount, Decimal("125000.00"))
+        self.assertEqual(salary.catalog_kind, "custom")
 
     def test_stock_batch_serializer_returns_fractional_remaining_bunches(self):
         self.batch.remaining_stems = 85
@@ -2199,6 +2207,55 @@ class ApiTests(TestCase):
         self.assertEqual(response.data["by_day"][0]["count"], 10)
         self.assertEqual(Decimal(summary["avg_fee_per_item"]), Decimal("50000.00"))
 
+    def test_florist_stats_use_salary_quantity_after_catalog_quantity_changes(self):
+        user = User.objects.create_user("salary-snapshot-florist", password="password", first_name="Snapshot")
+        profile = FloristProfile.objects.create(user=user, staff_type="florist")
+        item = CatalogItem.objects.create(name_uz="Snapshot buket", arrangement_type="bouquet", volume="small", catalog_kind="standard", price=Decimal("500000"), quantity_total=6, status="available", florist=profile)
+        FloristSalaryEntry.objects.create(
+            florist=profile,
+            amount=Decimal("360000"),
+            quantity=24,
+            unit_amount=Decimal("15000"),
+            source="catalog",
+            work_date="2026-07-25",
+            catalog_item=item,
+            catalog_name=item.name_uz,
+            catalog_kind=item.catalog_kind,
+            arrangement_type=item.arrangement_type,
+            volume=item.volume,
+        )
+        response = self.client.get(f"/api/florists/{profile.id}/stats/")
+        self.assertEqual(response.status_code, 200)
+        summary = response.data["summary"]
+        self.assertEqual(summary["catalog_count"], 24)
+        self.assertEqual(response.data["by_arrangement"][0]["count"], 24)
+        self.assertEqual(response.data["by_volume"][0]["count"], 24)
+        row = response.data["salary_entries"][0]
+        self.assertEqual(row["quantity_total"], 24)
+        self.assertEqual(row["current_catalog_quantity"], 6)
+        self.assertEqual(Decimal(summary["avg_fee_per_item"]), Decimal("15000.00"))
+
+    def test_florist_stats_include_unlinked_developer_catalog_salary(self):
+        user = User.objects.create_user("developer-salary-florist", password="password", first_name="Developer")
+        profile = FloristProfile.objects.create(user=user, staff_type="florist")
+        FloristSalaryEntry.objects.create(
+            florist=profile,
+            amount=Decimal("70000"),
+            quantity=1,
+            unit_amount=Decimal("70000"),
+            source="custom_catalog",
+            work_date="2026-07-25",
+            catalog_name="Developer qo'shgan katalog",
+        )
+        response = self.client.get(f"/api/florists/{profile.id}/stats/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Decimal(response.data["summary"]["salary_total"]), Decimal("70000.00"))
+        self.assertEqual(response.data["summary"]["catalog_count"], 1)
+        self.assertEqual(response.data["summary"]["custom_count"], 1)
+        self.assertEqual(sum(Decimal(row["amount"]) for row in response.data["by_volume"]), Decimal("70000.00"))
+        self.assertEqual(response.data["by_volume"][0]["arrangement_label"], "Belgilanmagan")
+        self.assertEqual(response.data["by_volume"][0]["volume"], "Belgilanmagan")
+
     def test_florist_stats_respects_date_range(self):
         profile = self._florist_with_history()
         response = self.client.get(f"/api/florists/{profile.id}/stats/?date_from=2026-07-21&date_to=2026-07-21")
@@ -3284,7 +3341,10 @@ class ApiTests(TestCase):
         self.assertEqual(history.snapshot["sale_materials"][0]["quantity"], 4)
         self.assertEqual(history.snapshot["sale_decoration"]["amount"], "80000.00")
         self.assertTrue(PackagingMovement.objects.filter(packaging=material, reference_type="catalog_sale", reference_id=history.id, quantity=-4).exists())
-        self.assertTrue(FloristSalaryEntry.objects.filter(florist=decorator, catalog_item=item, source="sale_decoration", amount=Decimal("80000.00")).exists())
+        salary = FloristSalaryEntry.objects.get(florist=decorator, catalog_item=item, source="sale_decoration")
+        self.assertEqual(salary.amount, Decimal("80000.00"))
+        self.assertEqual(salary.quantity, 2)
+        self.assertEqual(salary.unit_amount, Decimal("40000.00"))
 
     def test_catalog_restore_sale_returns_item_to_available_and_removes_accounting_sale(self):
         item = CatalogItem.objects.create(name_uz="Qaytariladigan buket", arrangement_type="bouquet", price=Decimal("300000"), quantity_total=1, status="available")
@@ -3325,7 +3385,10 @@ class ApiTests(TestCase):
         self.assertEqual(history.quantity, 1)
         self.assertEqual(material.quantity, 8)
         self.assertTrue(PackagingMovement.objects.filter(packaging=material, reference_type="catalog_sale_restore", quantity=2).exists())
-        self.assertEqual(FloristSalaryEntry.objects.get(florist=decorator, catalog_item=item, source="sale_decoration").amount, Decimal("40000.00"))
+        salary = FloristSalaryEntry.objects.get(florist=decorator, catalog_item=item, source="sale_decoration")
+        self.assertEqual(salary.amount, Decimal("40000.00"))
+        self.assertEqual(salary.quantity, 1)
+        self.assertEqual(salary.unit_amount, Decimal("40000.00"))
 
     def test_catalog_sell_api_accepts_discounted_price_with_reason(self):
         item = CatalogItem.objects.create(name_uz="API skidka buket", arrangement_type="bouquet", price=500000, quantity_total=2, status="available")

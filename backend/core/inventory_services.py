@@ -40,6 +40,15 @@ def catalog_snapshot(item):
     }
 
 
+def catalog_salary_snapshot(item):
+    return {
+        "catalog_name": item.name_uz or "",
+        "catalog_kind": item.catalog_kind or "",
+        "arrangement_type": item.arrangement_type or "",
+        "volume": item.volume or "",
+    }
+
+
 def create_catalog_history(item, action, user=None, quantity=0, listed_unit_price=None, sold_unit_price=None, discount_reason="", note="", snapshot=None, reservation=None):
     listed = money(listed_unit_price if listed_unit_price is not None else item.price)
     sold = money(sold_unit_price if sold_unit_price is not None else listed)
@@ -163,19 +172,25 @@ def sync_catalog_florist_salary(item, user):
         return None
     source = "custom_catalog" if item.catalog_kind == "custom" else "catalog"
     FloristSalaryEntry.objects.filter(catalog_item=item, source__in=["catalog", "custom_catalog"]).exclude(florist=item.florist, source=source).delete()
-    amount = Decimal(item.florist_salary_amount) * Decimal(item.quantity_total or 1)
     existing = FloristSalaryEntry.objects.filter(florist=item.florist, source=source, catalog_item=item).first()
+    quantity = int(existing.quantity or item.quantity_total or 1) if existing else int(item.quantity_total or 1)
+    unit_amount = Decimal(item.florist_salary_amount or 0)
+    amount = unit_amount * Decimal(quantity)
     old_amount = existing.amount if existing else None
+    defaults = {
+        "amount": amount,
+        "quantity": quantity,
+        "unit_amount": unit_amount,
+        "work_date": timezone.localtime(item.created_at).date() if item.created_at else timezone.localdate(),
+        "note": f"{item.name_uz} uchun florist haqi",
+        "created_by": user if getattr(user, "is_authenticated", False) else None,
+    }
+    defaults.update(catalog_salary_snapshot(item))
     entry, _ = FloristSalaryEntry.objects.update_or_create(
         florist=item.florist,
         source=source,
         catalog_item=item,
-        defaults={
-            "amount": amount,
-            "work_date": timezone.localtime(item.created_at).date() if item.created_at else timezone.localdate(),
-            "note": f"{item.name_uz} uchun florist haqi",
-            "created_by": user if getattr(user, "is_authenticated", False) else None,
-        },
+        defaults=defaults,
         )
     if old_amount != entry.amount:
         Notification.objects.create(
@@ -197,17 +212,24 @@ def sync_catalog_decoration_salary(item, user):
         FloristSalaryEntry.objects.filter(catalog_item=item, source="decoration").delete()
         return None
     FloristSalaryEntry.objects.filter(catalog_item=item, source="decoration").exclude(florist=item.decoration_florist).delete()
-    amount = Decimal(item.decoration_salary_amount) * Decimal(item.quantity_total or 1)
+    existing = FloristSalaryEntry.objects.filter(florist=item.decoration_florist, source="decoration", catalog_item=item).first()
+    quantity = int(existing.quantity or item.quantity_total or 1) if existing else int(item.quantity_total or 1)
+    unit_amount = Decimal(item.decoration_salary_amount or 0)
+    amount = unit_amount * Decimal(quantity)
+    defaults = {
+        "amount": amount,
+        "quantity": quantity,
+        "unit_amount": unit_amount,
+        "work_date": timezone.localtime(item.created_at).date() if item.created_at else timezone.localdate(),
+        "note": f"{item.name_uz} uchun oformleniya haqi",
+        "created_by": user if getattr(user, "is_authenticated", False) else None,
+    }
+    defaults.update(catalog_salary_snapshot(item))
     entry, _ = FloristSalaryEntry.objects.update_or_create(
         florist=item.decoration_florist,
         source="decoration",
         catalog_item=item,
-        defaults={
-            "amount": amount,
-            "work_date": timezone.localtime(item.created_at).date() if item.created_at else timezone.localdate(),
-            "note": f"{item.name_uz} uchun oformleniya haqi",
-            "created_by": user if getattr(user, "is_authenticated", False) else None,
-        },
+        defaults=defaults,
     )
     return entry
 
@@ -345,25 +367,37 @@ def sell_packaging_item(packaging, quantity=1, sale_price=None, payment_type="",
 def add_catalog_sale_decoration_salary(item, florist, quantity, user, sold_at=None):
     if not florist:
         return None
-    amount = Decimal(florist.decoration_fee or 0) * Decimal(quantity or 1)
+    quantity = int(quantity or 1)
+    unit_amount = Decimal(florist.decoration_fee or 0)
+    amount = unit_amount * Decimal(quantity)
     if amount <= 0:
         return None
+    defaults = {
+        "amount": amount,
+        "quantity": quantity,
+        "unit_amount": unit_amount,
+        "work_date": timezone.localtime(sold_at).date() if sold_at else timezone.localdate(),
+        "note": f"{item.name_uz} sotuv oformleniyasi",
+        "created_by": user if getattr(user, "is_authenticated", False) else None,
+    }
+    defaults.update(catalog_salary_snapshot(item))
     entry, created = FloristSalaryEntry.objects.get_or_create(
         florist=florist,
         source="sale_decoration",
         catalog_item=item,
-        defaults={
-            "amount": amount,
-            "work_date": timezone.localtime(sold_at).date() if sold_at else timezone.localdate(),
-            "note": f"{item.name_uz} sotuv oformleniyasi",
-            "created_by": user if getattr(user, "is_authenticated", False) else None,
-        },
+        defaults=defaults,
     )
     if not created:
         entry.amount = Decimal(entry.amount or 0) + amount
+        entry.quantity = int(entry.quantity or 0) + quantity
+        if entry.quantity:
+            entry.unit_amount = (Decimal(entry.amount or 0) / Decimal(entry.quantity)).quantize(Decimal("0.01"))
         entry.work_date = timezone.localtime(sold_at).date() if sold_at else entry.work_date
         entry.created_by = user if getattr(user, "is_authenticated", False) else entry.created_by
-        entry.save(update_fields=["amount", "work_date", "created_by", "updated_at"])
+        for key, value in catalog_salary_snapshot(item).items():
+            if not getattr(entry, key):
+                setattr(entry, key, value)
+        entry.save(update_fields=["amount", "quantity", "unit_amount", "work_date", "created_by", "catalog_name", "catalog_kind", "arrangement_type", "volume", "updated_at"])
     return entry
 
 
@@ -1740,10 +1774,12 @@ def restore_catalog_sale(item, user, quantity=None, sale_history=None, reason=""
             if entry:
                 amount = Decimal(str(sale_decoration.get("amount") or 0)) * Decimal(restore_quantity) / Decimal(original_quantity)
                 entry.amount = Decimal(entry.amount or 0) - amount
-                if entry.amount <= 0:
+                entry.quantity = max(int(entry.quantity or 0) - int(restore_quantity or 0), 0)
+                if entry.amount <= 0 or entry.quantity <= 0:
                     entry.delete()
                 else:
-                    entry.save(update_fields=["amount", "updated_at"])
+                    entry.unit_amount = (Decimal(entry.amount or 0) / Decimal(entry.quantity)).quantize(Decimal("0.01"))
+                    entry.save(update_fields=["amount", "quantity", "unit_amount", "updated_at"])
         for debt in list(Debt.objects.select_for_update().filter(catalog_history=history)):
             if restore_quantity >= int(debt.quantity or 0):
                 debt.delete()
@@ -2748,8 +2784,10 @@ def create_catalog_rework(florist, florist_amount, sources, stock_inputs, output
         rework.save(update_fields=["waste_cost", "updated_at"])
 
         if florist_amount > 0:
+            output_quantity = sum(int(row.quantity_total or 0) for row in created_items) or 1
+            unit_amount = (florist_amount / Decimal(output_quantity)).quantize(Decimal("0.01"))
             FloristSalaryEntry.objects.create(
-                florist=florist, amount=florist_amount, source="rework",
+                florist=florist, amount=florist_amount, quantity=output_quantity, unit_amount=unit_amount, source="rework",
                 rework=rework,
                 note=note or f"Restavratsiya #{rework.id}",
                 created_by=user if getattr(user, "is_authenticated", False) else None,

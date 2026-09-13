@@ -631,20 +631,34 @@ class FloristSalaryEntrySerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"reason": "Shogird kunlik ish haqini o‘zgartirish sababi kerak"})
         return attrs
 
+    def normalize_salary_amount(self, validated_data, instance=None):
+        source = validated_data.get("source", getattr(instance, "source", ""))
+        quantity = validated_data.get("quantity", getattr(instance, "quantity", 0) if instance else 0)
+        unit_amount = validated_data.get("unit_amount", getattr(instance, "unit_amount", Decimal("0")) if instance else Decimal("0"))
+        catalog_item = validated_data.get("catalog_item", getattr(instance, "catalog_item", None) if instance else None)
+        if catalog_item:
+            validated_data.setdefault("catalog_name", catalog_item.name_uz or "")
+            validated_data.setdefault("catalog_kind", catalog_item.catalog_kind or "")
+            validated_data.setdefault("arrangement_type", catalog_item.arrangement_type or "")
+            validated_data.setdefault("volume", catalog_item.volume or "")
+        if "amount" not in validated_data and quantity and unit_amount:
+            validated_data["amount"] = Decimal(str(unit_amount)) * int(quantity)
+        elif "amount" in validated_data and source in FloristSalaryEntry.PRODUCTION_SOURCES and not catalog_item and not quantity:
+            validated_data["quantity"] = 1
+            validated_data["unit_amount"] = validated_data["amount"]
+        elif source in FloristSalaryEntry.PRODUCTION_SOURCES and not catalog_item and quantity and not unit_amount:
+            validated_data["unit_amount"] = Decimal(str(validated_data.get("amount", 0))) / Decimal(int(quantity))
+        return validated_data
+
+    def create(self, validated_data):
+        return super().create(self.normalize_salary_amount(validated_data))
+
     def update(self, instance, validated_data):
         reason = validated_data.pop("reason", "")
         if reason:
             note = validated_data.get("note", instance.note or "")
             validated_data["note"] = (note + "\n" if note else "") + f"O‘zgartirish sababi: {reason}"
-        # Qo'shimcha oformleniyada summa soni va bittasining narxidan chiqadi.
-        # Soni yoki narxi tuzatilsa summa o'zi qayta hisoblanadi — admin uni
-        # qo'lda ham yozishi mumkin, o'shanda yozgani qoladi.
-        if instance.source == "extra_decoration" and "amount" not in validated_data:
-            quantity = validated_data.get("quantity", instance.quantity)
-            unit_amount = validated_data.get("unit_amount", instance.unit_amount)
-            if quantity and unit_amount:
-                validated_data["amount"] = Decimal(str(unit_amount)) * quantity
-        return super().update(instance, validated_data)
+        return super().update(instance, self.normalize_salary_amount(validated_data, instance))
 
     @extend_schema_field(serializers.DictField())
     def get_catalog_item_detail(self, obj):

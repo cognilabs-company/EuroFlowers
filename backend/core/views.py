@@ -1431,6 +1431,47 @@ def florist_item_revenue_map(item_ids):
     return revenue
 
 
+def salary_entry_quantity(row):
+    if int(row.quantity or 0) > 0:
+        return int(row.quantity or 0)
+    if row.unit_amount and Decimal(row.unit_amount or 0) > 0:
+        return max(int((Decimal(row.amount or 0) / Decimal(row.unit_amount)).quantize(Decimal("1"))), 1)
+    if row.catalog_item_id and row.source in FloristSalaryEntry.PRODUCTION_SOURCES:
+        return int(row.catalog_item.quantity_total or 1)
+    if row.source in FloristSalaryEntry.PRODUCTION_SOURCES and Decimal(row.amount or 0) > 0:
+        return 1
+    return 0
+
+
+def salary_quantity_case(prefix=""):
+    return Case(
+        When(**{f"{prefix}quantity__gt": 0}, then=F(f"{prefix}quantity")),
+        When(**{f"{prefix}catalog_item__isnull": False}, then=F(f"{prefix}catalog_item__quantity_total")),
+        When(**{f"{prefix}amount__gt": 0}, then=Value(1)),
+        default=Value(0),
+        output_field=IntegerField(),
+    )
+
+
+def salary_entry_catalog_fields(row):
+    item = row.catalog_item
+    kind = row.catalog_kind or (item.catalog_kind if item else "")
+    if not kind and row.source == "custom_catalog":
+        kind = "custom"
+    elif not kind and row.source == "catalog":
+        kind = "standard"
+    arrangement = row.arrangement_type or (item.arrangement_type if item else "")
+    volume = row.volume or (item.volume if item else "")
+    return {
+        "name": row.catalog_name or (item.name_uz if item else ""),
+        "kind": kind or "",
+        "arrangement": arrangement or "",
+        "arrangement_key": arrangement or "unknown",
+        "volume": volume or "",
+        "volume_key": volume or "Belgilanmagan",
+    }
+
+
 def florist_stats_data(profile, request, include_sales=True):
     """Florist bo'yicha to'liq statistika. Detail API, florist dashboard va Excel eksport shundan foydalanadi.
     include_sales=False bo'lsa sotuv narxi, tushum va foyda chiqarilmaydi — florist o'zi ko'rgan holat."""
@@ -1460,14 +1501,16 @@ def florist_stats_data(profile, request, include_sales=True):
     for row in salary:
         item = row.catalog_item
         amount = Decimal(row.amount or 0)
-        arrangement = item.arrangement_type if item else ""
-        volume = (item.volume if item else "") or "Belgilanmagan"
-        kind = (item.catalog_kind if item else "") or ""
+        fields = salary_entry_catalog_fields(row)
+        arrangement = fields["arrangement"]
+        arrangement_key = fields["arrangement_key"]
+        volume = fields["volume_key"]
+        kind = fields["kind"]
         sold = revenue_map.get(row.catalog_item_id, {}) if row.catalog_item_id else {}
         sold_quantity = int(sold.get("sold_quantity") or 0)
         sale_revenue = Decimal(sold.get("revenue") or 0)
-        is_production = bool(item and row.source in ["catalog", "custom_catalog"])
-        produced_quantity = int(item.quantity_total or 1) if is_production else 0
+        is_production = row.source in FloristSalaryEntry.PRODUCTION_SOURCES
+        produced_quantity = salary_entry_quantity(row) if is_production else 0
 
         summary["salary_total"] += amount
         if row.source == "daily":
@@ -1491,19 +1534,20 @@ def florist_stats_data(profile, request, include_sales=True):
             else:
                 summary["standard_count"] += produced_quantity
 
-        source_row = by_source.setdefault(row.source, {"source": row.source, "source_label": row.get_source_display(), "count": 0, "amount": Decimal("0")})
+        source_row = by_source.setdefault(row.source, {"source": row.source, "source_label": row.get_source_display(), "count": 0, "quantity": 0, "amount": Decimal("0")})
         source_row["count"] += 1
+        source_row["quantity"] += produced_quantity if is_production else salary_entry_quantity(row)
         source_row["amount"] += amount
 
-        if arrangement and is_production:
-            arr_row = by_arrangement.setdefault(arrangement, {"arrangement_type": arrangement, "arrangement_label": ARRANGEMENT_LABELS.get(arrangement, arrangement), "count": 0, "amount": Decimal("0"), "sold_quantity": 0, "sale_revenue": Decimal("0")})
+        if is_production:
+            arr_row = by_arrangement.setdefault(arrangement_key, {"arrangement_type": arrangement_key, "arrangement_label": arrangement_text(arrangement) if arrangement else "Belgilanmagan", "count": 0, "amount": Decimal("0"), "sold_quantity": 0, "sale_revenue": Decimal("0")})
             arr_row["count"] += produced_quantity
             arr_row["amount"] += amount
             arr_row["sold_quantity"] += sold_quantity
             arr_row["sale_revenue"] += sale_revenue
 
-            vol_key = (arrangement, volume)
-            vol_row = by_volume.setdefault(vol_key, {"arrangement_type": arrangement, "arrangement_label": ARRANGEMENT_LABELS.get(arrangement, arrangement), "volume": volume, "count": 0, "amount": Decimal("0"), "sold_quantity": 0, "sale_revenue": Decimal("0")})
+            vol_key = (arrangement_key, volume)
+            vol_row = by_volume.setdefault(vol_key, {"arrangement_type": arrangement_key, "arrangement_label": arrangement_text(arrangement) if arrangement else "Belgilanmagan", "volume": volume, "count": 0, "amount": Decimal("0"), "sold_quantity": 0, "sale_revenue": Decimal("0")})
             vol_row["count"] += produced_quantity
             vol_row["amount"] += amount
             vol_row["sold_quantity"] += sold_quantity
@@ -1530,14 +1574,17 @@ def florist_stats_data(profile, request, include_sales=True):
             "note": row.note,
             "added_by": user_full_name(row.created_by),
             "catalog_item_id": row.catalog_item_id,
-            "catalog_name": item.name_uz if item else "",
+            "catalog_name": fields["name"],
             "catalog_kind": kind,
             "catalog_kind_label": catalog_kind_text(kind),
             "arrangement_type": arrangement,
             "arrangement_label": arrangement_text(arrangement) if arrangement else "",
             "volume_label": volume_text(volume) if volume else "",
-            "volume": item.volume if item else "",
-            "quantity_total": int(item.quantity_total or 0) if item else 0,
+            "volume": fields["volume"],
+            "quantity_total": produced_quantity if is_production else int(item.quantity_total or 0) if item else 0,
+            "salary_quantity": salary_entry_quantity(row),
+            "unit_amount": Decimal(row.unit_amount or 0),
+            "current_catalog_quantity": int(item.quantity_total or 0) if item else 0,
             "quantity_sold": int(item.quantity_sold or 0) if item else 0,
             "listed_price": Decimal(item.price or 0) if item else Decimal("0"),
             "sold_quantity": sold_quantity,
@@ -1635,18 +1682,16 @@ class FloristProfileViewSet(TotalsListMixin, ScopedViewSet):
     def get_queryset(self):
         date_from, date_to = self.report_period()
         salary_filter = Q()
-        catalog_range = Q()
+        production_filter = Q(salary_entries__source__in=FloristSalaryEntry.PRODUCTION_SOURCES)
         if date_from:
             salary_filter &= Q(salary_entries__work_date__gte=date_from)
-            catalog_range &= Q(created_at__date__gte=date_from)
+            production_filter &= Q(salary_entries__work_date__gte=date_from)
         if date_to:
             salary_filter &= Q(salary_entries__work_date__lte=date_to)
-            catalog_range &= Q(created_at__date__lte=date_to)
-        catalog_quantity = (CatalogItem.objects.filter(catalog_range, florist=OuterRef("pk"))
-                            .values("florist").annotate(total=Coalesce(Sum("quantity_total"), 0)).values("total")[:1])
+            production_filter &= Q(salary_entries__work_date__lte=date_to)
         queryset = super().get_queryset().annotate(
             salary_total=Coalesce(Sum("salary_entries__amount", filter=salary_filter or None), Decimal("0")),
-            catalog_count=Coalesce(Subquery(catalog_quantity, output_field=IntegerField()), 0),
+            catalog_count=Coalesce(Sum(salary_quantity_case("salary_entries__"), filter=production_filter), 0),
         )
         role = getattr(getattr(self.request.user, "profile", None), "role", None)
         if role in ["florist", "apprentice"]:
@@ -1667,13 +1712,13 @@ class FloristProfileViewSet(TotalsListMixin, ScopedViewSet):
         catalog_rows = CatalogItem.objects.filter(florist_id__in=ids)
         if date_from:
             salary_rows = salary_rows.filter(work_date__gte=date_from)
-            catalog_rows = catalog_rows.filter(created_at__date__gte=date_from)
         if date_to:
             salary_rows = salary_rows.filter(work_date__lte=date_to)
-            catalog_rows = catalog_rows.filter(created_at__date__lte=date_to)
         salary = salary_rows.aggregate(t_amount=money_sum(F("amount")))
+        produced = salary_rows.filter(source__in=FloristSalaryEntry.PRODUCTION_SOURCES).aggregate(
+            t_quantity=Coalesce(Sum(salary_quantity_case()), Value(0), output_field=IntegerField()),
+        )
         catalog = catalog_rows.aggregate(
-            t_quantity=int_sum("quantity_total"),
             t_remaining=int_sum(CATALOG_REMAINING_EXPR),
         )
         stock = FloristStockBalance.objects.filter(florist_id__in=ids, remaining_stems__gt=0).aggregate(
@@ -1685,7 +1730,7 @@ class FloristProfileViewSet(TotalsListMixin, ScopedViewSet):
             "inactive": profiles.filter(is_active=False).count(),
             "by_staff_type": count_by(profiles, "staff_type"),
             "salary_total": money(salary["t_amount"]),
-            "catalog_quantity": catalog["t_quantity"],
+            "catalog_quantity": produced["t_quantity"],
             "catalog_remaining": catalog["t_remaining"],
             # floristlarning qo'lida yopilmagan gul — bu joriy qoldiq,
             # shuning uchun davr bilan cheklanmaydi
@@ -3939,29 +3984,28 @@ def export_all_florists_workbook(request):
         attendance = FloristAttendance.objects.filter(florist=profile)
         if date_from:
             salary = salary.filter(work_date__gte=date_from)
-            catalog = catalog.filter(created_at__date__gte=date_from)
             attendance = attendance.filter(work_date__gte=date_from)
         if date_to:
             salary = salary.filter(work_date__lte=date_to)
-            catalog = catalog.filter(created_at__date__lte=date_to)
             attendance = attendance.filter(work_date__lte=date_to)
+        produced_salary = salary.filter(source__in=FloristSalaryEntry.PRODUCTION_SOURCES)
         sheet.append([
             str(profile),
             profile.get_staff_type_display(),
-            sum(int(item.quantity_total or 0) for item in catalog),
-            sum(int(item.quantity_total or 0) for item in catalog.filter(catalog_kind="custom")),
-            sum(int(item.quantity_total or 0) for item in catalog.filter(catalog_kind="standard")),
+            produced_salary.aggregate(value=Coalesce(Sum(salary_quantity_case()), Value(0), output_field=IntegerField()))["value"],
+            produced_salary.filter(source="custom_catalog").aggregate(value=Coalesce(Sum(salary_quantity_case()), Value(0), output_field=IntegerField()))["value"],
+            produced_salary.filter(source="catalog").aggregate(value=Coalesce(Sum(salary_quantity_case()), Value(0), output_field=IntegerField()))["value"],
             money_label(salary.aggregate(value=Coalesce(Sum("amount"), Decimal("0")))["value"]),
             attendance.filter(check_in_at__isnull=False).count(),
         ])
         daily_rows = {}
         for row in salary.select_related("catalog_item"):
-            item = row.catalog_item
-            if not item or row.source not in ["catalog", "custom_catalog"]:
+            if row.source not in FloristSalaryEntry.PRODUCTION_SOURCES:
                 continue
-            key = (row.work_date, item.catalog_kind if item else "", item.arrangement_type if item else "", item.volume if item else "")
+            fields = salary_entry_catalog_fields(row)
+            key = (row.work_date, fields["kind"], fields["arrangement"], fields["volume"])
             current = daily_rows.setdefault(key, {"count": 0, "amount": Decimal("0")})
-            current["count"] += int(item.quantity_total or 1)
+            current["count"] += salary_entry_quantity(row)
             current["amount"] += Decimal(row.amount or 0)
         for key, value in sorted(daily_rows.items(), key=lambda row: row[0], reverse=True):
             work_date, catalog_kind, arrangement_type, volume = key
