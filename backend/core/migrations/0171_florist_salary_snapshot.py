@@ -33,8 +33,6 @@ def fill_salary_snapshots(apps, schema_editor):
             updates.append("catalog_name")
         if row.source == "rework" and quantity <= 0 and row.rework_id:
             quantity = CatalogReworkOutput.objects.filter(rework_id=row.rework_id).aggregate(total=models.Sum("catalog_item__quantity_total"))["total"] or 0
-        if quantity <= 0 and unit_amount > 0:
-            quantity = max(int((amount / unit_amount).quantize(Decimal("1"), rounding=ROUND_HALF_UP)), 1)
         if quantity <= 0 and row.source in production_sources and item:
             quantity = int(item.quantity_total or 1)
         if quantity <= 0 and row.source in production_sources and amount > 0:
@@ -43,6 +41,11 @@ def fill_salary_snapshots(apps, schema_editor):
             quantity = 1
         if unit_amount <= 0 and quantity > 0:
             unit_amount = (amount / Decimal(quantity)).quantize(Decimal("0.01"))
+        if row.source in production_sources and quantity > 0 and unit_amount > 0:
+            amount = (unit_amount * Decimal(quantity)).quantize(Decimal("0.01"))
+        if row.amount != amount:
+            row.amount = amount
+            updates.append("amount")
         if row.quantity != quantity:
             row.quantity = quantity
             updates.append("quantity")

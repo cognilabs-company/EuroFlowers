@@ -1434,8 +1434,6 @@ def florist_item_revenue_map(item_ids):
 def salary_entry_quantity(row):
     if int(row.quantity or 0) > 0:
         return int(row.quantity or 0)
-    if row.unit_amount and Decimal(row.unit_amount or 0) > 0:
-        return max(int((Decimal(row.amount or 0) / Decimal(row.unit_amount)).quantize(Decimal("1"))), 1)
     if row.catalog_item_id and row.source in FloristSalaryEntry.PRODUCTION_SOURCES:
         return int(row.catalog_item.quantity_total or 1)
     if row.source in FloristSalaryEntry.PRODUCTION_SOURCES and Decimal(row.amount or 0) > 0:

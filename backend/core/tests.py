@@ -2207,14 +2207,14 @@ class ApiTests(TestCase):
         self.assertEqual(response.data["by_day"][0]["count"], 10)
         self.assertEqual(Decimal(summary["avg_fee_per_item"]), Decimal("50000.00"))
 
-    def test_florist_stats_use_salary_quantity_after_catalog_quantity_changes(self):
+    def test_florist_stats_do_not_infer_quantity_from_overwritten_amount(self):
         user = User.objects.create_user("salary-snapshot-florist", password="password", first_name="Snapshot")
         profile = FloristProfile.objects.create(user=user, staff_type="florist")
         item = CatalogItem.objects.create(name_uz="Snapshot buket", arrangement_type="bouquet", volume="small", catalog_kind="standard", price=Decimal("500000"), quantity_total=6, status="available", florist=profile)
         FloristSalaryEntry.objects.create(
             florist=profile,
-            amount=Decimal("360000"),
-            quantity=24,
+            amount=Decimal("90000"),
+            quantity=6,
             unit_amount=Decimal("15000"),
             source="catalog",
             work_date="2026-07-25",
@@ -2227,11 +2227,11 @@ class ApiTests(TestCase):
         response = self.client.get(f"/api/florists/{profile.id}/stats/")
         self.assertEqual(response.status_code, 200)
         summary = response.data["summary"]
-        self.assertEqual(summary["catalog_count"], 24)
-        self.assertEqual(response.data["by_arrangement"][0]["count"], 24)
-        self.assertEqual(response.data["by_volume"][0]["count"], 24)
+        self.assertEqual(summary["catalog_count"], 6)
+        self.assertEqual(response.data["by_arrangement"][0]["count"], 6)
+        self.assertEqual(response.data["by_volume"][0]["count"], 6)
         row = response.data["salary_entries"][0]
-        self.assertEqual(row["quantity_total"], 24)
+        self.assertEqual(row["quantity_total"], 6)
         self.assertEqual(row["current_catalog_quantity"], 6)
         self.assertEqual(Decimal(summary["avg_fee_per_item"]), Decimal("15000.00"))
 
