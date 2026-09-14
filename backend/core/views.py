@@ -1504,10 +1504,12 @@ def florist_stats_data(profile, request, include_sales=True):
         arrangement_key = fields["arrangement_key"]
         volume = fields["volume_key"]
         kind = fields["kind"]
+        is_production = row.source in FloristSalaryEntry.PRODUCTION_SOURCES and bool(row.catalog_item_id)
+        if row.source in FloristSalaryEntry.PRODUCTION_SOURCES and not row.catalog_item_id:
+            amount = Decimal("0")
         sold = revenue_map.get(row.catalog_item_id, {}) if row.catalog_item_id else {}
         sold_quantity = int(sold.get("sold_quantity") or 0)
         sale_revenue = Decimal(sold.get("revenue") or 0)
-        is_production = row.source in FloristSalaryEntry.PRODUCTION_SOURCES
         produced_quantity = salary_entry_quantity(row) if is_production else 0
 
         summary["salary_total"] += amount
@@ -1679,7 +1681,7 @@ class FloristProfileViewSet(TotalsListMixin, ScopedViewSet):
 
     def get_queryset(self):
         date_from, date_to = self.report_period()
-        salary_filter = Q()
+        salary_filter = ~Q(salary_entries__source__in=FloristSalaryEntry.PRODUCTION_SOURCES, salary_entries__catalog_item__isnull=True)
         production_filter = Q(salary_entries__source__in=FloristSalaryEntry.PRODUCTION_SOURCES)
         if date_from:
             salary_filter &= Q(salary_entries__work_date__gte=date_from)
@@ -1712,7 +1714,7 @@ class FloristProfileViewSet(TotalsListMixin, ScopedViewSet):
             salary_rows = salary_rows.filter(work_date__gte=date_from)
         if date_to:
             salary_rows = salary_rows.filter(work_date__lte=date_to)
-        salary = salary_rows.aggregate(t_amount=money_sum(F("amount")))
+        salary = salary_rows.exclude(source__in=FloristSalaryEntry.PRODUCTION_SOURCES, catalog_item__isnull=True).aggregate(t_amount=money_sum(F("amount")))
         produced = salary_rows.filter(source__in=FloristSalaryEntry.PRODUCTION_SOURCES).aggregate(
             t_quantity=Coalesce(Sum(salary_quantity_case()), Value(0), output_field=IntegerField()),
         )

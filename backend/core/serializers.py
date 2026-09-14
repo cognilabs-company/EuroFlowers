@@ -629,6 +629,10 @@ class FloristSalaryEntrySerializer(serializers.ModelSerializer):
             reason = attrs.get("reason") or attrs.get("note")
             if not reason:
                 raise serializers.ValidationError({"reason": "Shogird kunlik ish haqini o‘zgartirish sababi kerak"})
+        source = attrs.get("source", getattr(self.instance, "source", ""))
+        catalog_item = attrs.get("catalog_item", getattr(self.instance, "catalog_item", None))
+        if source in FloristSalaryEntry.PRODUCTION_SOURCES and not catalog_item:
+            raise serializers.ValidationError({"catalog_item": "Katalog ish haqi uchun katalog tanlanishi kerak"})
         return attrs
 
     def normalize_salary_amount(self, validated_data, instance=None):

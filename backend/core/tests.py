@@ -2235,7 +2235,20 @@ class ApiTests(TestCase):
         self.assertEqual(row["current_catalog_quantity"], 6)
         self.assertEqual(Decimal(summary["avg_fee_per_item"]), Decimal("15000.00"))
 
-    def test_florist_stats_include_unlinked_developer_catalog_salary(self):
+    def test_sync_catalog_salary_keeps_original_quantity_after_later_transfer(self):
+        from .inventory_services import sync_catalog_florist_salary
+        user = User.objects.create_user("salary-sync-florist", password="password", first_name="Sync")
+        profile = FloristProfile.objects.create(user=user, staff_type="florist")
+        item = CatalogItem.objects.create(name_uz="Sync buket", arrangement_type="bouquet", volume="small", catalog_kind="standard", price=Decimal("500000"), quantity_total=10, status="available", florist=profile, florist_salary_amount=Decimal("15000"))
+        sync_catalog_florist_salary(item, self.user)
+        item.quantity_total = 6
+        item.save(update_fields=["quantity_total"])
+        sync_catalog_florist_salary(item, self.user)
+        salary = FloristSalaryEntry.objects.get(florist=profile, catalog_item=item, source="catalog")
+        self.assertEqual(salary.quantity, 10)
+        self.assertEqual(salary.amount, Decimal("150000.00"))
+
+    def test_florist_stats_ignore_unlinked_developer_catalog_salary(self):
         user = User.objects.create_user("developer-salary-florist", password="password", first_name="Developer")
         profile = FloristProfile.objects.create(user=user, staff_type="florist")
         FloristSalaryEntry.objects.create(
@@ -2249,12 +2262,10 @@ class ApiTests(TestCase):
         )
         response = self.client.get(f"/api/florists/{profile.id}/stats/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(Decimal(response.data["summary"]["salary_total"]), Decimal("70000.00"))
-        self.assertEqual(response.data["summary"]["catalog_count"], 1)
-        self.assertEqual(response.data["summary"]["custom_count"], 1)
-        self.assertEqual(sum(Decimal(row["amount"]) for row in response.data["by_volume"]), Decimal("70000.00"))
-        self.assertEqual(response.data["by_volume"][0]["arrangement_label"], "Belgilanmagan")
-        self.assertEqual(response.data["by_volume"][0]["volume"], "Belgilanmagan")
+        self.assertEqual(Decimal(response.data["summary"]["salary_total"]), Decimal("0.00"))
+        self.assertEqual(response.data["summary"]["catalog_count"], 0)
+        self.assertEqual(response.data["summary"]["custom_count"], 0)
+        self.assertEqual(response.data["by_volume"], [])
 
     def test_florist_stats_respects_date_range(self):
         profile = self._florist_with_history()
