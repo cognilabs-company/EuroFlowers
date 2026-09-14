@@ -1434,7 +1434,7 @@ def florist_item_revenue_map(item_ids):
 def salary_entry_quantity(row):
     if int(row.quantity or 0) > 0:
         return int(row.quantity or 0)
-    if row.catalog_item_id and row.source in FloristSalaryEntry.PRODUCTION_SOURCES:
+    if row.catalog_item_id and row.source in FloristSalaryEntry.PRODUCTION_SOURCES and Decimal(row.amount or 0) > 0:
         return int(row.catalog_item.quantity_total or 1)
     if row.source in FloristSalaryEntry.PRODUCTION_SOURCES and Decimal(row.amount or 0) > 0:
         return 1
@@ -1539,7 +1539,7 @@ def florist_stats_data(profile, request, include_sales=True):
         source_row["quantity"] += produced_quantity if is_production else salary_entry_quantity(row)
         source_row["amount"] += amount
 
-        if is_production:
+        if is_production and (produced_quantity > 0 or amount > 0):
             arr_row = by_arrangement.setdefault(arrangement_key, {"arrangement_type": arrangement_key, "arrangement_label": arrangement_text(arrangement) if arrangement else "Belgilanmagan", "count": 0, "amount": Decimal("0"), "sold_quantity": 0, "sale_revenue": Decimal("0")})
             arr_row["count"] += produced_quantity
             arr_row["amount"] += amount
