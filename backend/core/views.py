@@ -2067,7 +2067,7 @@ class FloristStockBalanceViewSet(TotalsListMixin, viewsets.ReadOnlyModelViewSet)
                 result = close_all_florist_issues(
                     serializer.validated_data["florist"],
                     request.user,
-                    True,
+                    serializer.validated_data.get("absorb_remainder", True),
                 )
             else:
                 result = close_florist_issue(
@@ -2077,6 +2077,33 @@ class FloristStockBalanceViewSet(TotalsListMixin, viewsets.ReadOnlyModelViewSet)
                     request.user,
                     serializer.validated_data.get("absorb_remainder", True),
                 )
+        except (ValueError, TypeError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
+
+    @extend_schema(
+        request=inline_serializer(
+            name="FloristCloseAllIssuesRequest",
+            fields={
+                "florist": serializers.IntegerField(),
+                "absorb_remainder": serializers.BooleanField(required=False, default=True),
+            },
+        ),
+        responses=OpenApiResponse(description="Floristdagi hamma chiqim yopildi"),
+    )
+    @action(detail=False, methods=["post"], url_path="close-all-issues")
+    def close_all_issues(self, request):
+        if not has_page_permission(request.user, "inventory", True):
+            return forbidden()
+        florist = FloristProfile.objects.filter(pk=request.data.get("florist")).first()
+        if not florist:
+            return Response({"detail": "Florist tanlanmadi."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = close_all_florist_issues(
+                florist,
+                request.user,
+                str(request.data.get("absorb_remainder", "true")).lower() != "false",
+            )
         except (ValueError, TypeError) as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(result)

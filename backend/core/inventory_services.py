@@ -831,6 +831,31 @@ def florist_leftover_candidates(florist, batch):
     )
 
 
+def florist_fallback_catalog_items(florist):
+    return list(
+        CatalogItem.objects.filter(
+            florist=florist,
+            status__in=["available", "reserved", "sold"],
+            quantity_total__gt=0,
+        )
+        .order_by("created_at", "id")
+    )
+
+
+def florist_distribution_rows(florist, batch):
+    rows = florist_open_catalog_rows(florist, batch)
+    if rows:
+        return rows, False
+    rows = florist_leftover_candidates(florist, batch)
+    if rows:
+        return rows, True
+    items = florist_fallback_catalog_items(florist)
+    return [
+        CatalogComposition(catalog_item=item, stock_batch=batch, quantity_stems=0, quantity_bunches=0)
+        for item in items
+    ], True
+
+
 def florist_volume_rate_for(florist, item):
     return FloristVolumeRate.objects.filter(
         florist=florist, arrangement_type=item.arrangement_type, volume=item.volume, is_active=True,
@@ -857,20 +882,17 @@ def florist_weight_plan(florist, items):
     Qaytadi: ({katalog_id: og'irlik}, muammoli hajmlar ro'yxati, og'irlik manbai)
     """
     rates = {item.id: florist_volume_rate_for(florist, item) for item in items}
-    missing = sorted({volume_label(item) for item in items if rates[item.id] is None})
-    if missing:
-        return {}, missing, ""
-    stems = {item.id: int(rates[item.id].default_stems or 0) for item in items}
+    stems = {item.id: int(rates[item.id].default_stems or 0) if rates[item.id] else 0 for item in items}
     if all(value > 0 for value in stems.values()):
         return stems, [], "default_stems"
+    fees = {item.id: int(Decimal(rates[item.id].florist_fee or 0)) if rates[item.id] else 0 for item in items}
+    if any(value > 0 for value in fees.values()):
+        fees = {item.id: value if value > 0 else 1 for item, value in [(item, fees[item.id]) for item in items]}
+        return fees, [], "florist_fee"
     if any(value > 0 for value in stems.values()):
-        # bir qismida kiritilgan, bir qismida yo'q — aralashtirsak taqsimot buziladi
-        blank = sorted({volume_label(item) for item in items if stems[item.id] < 1})
-        return {}, blank, ""
-    fees = {item.id: int(Decimal(rates[item.id].florist_fee or 0)) for item in items}
-    if all(value < 1 for value in fees.values()):
-        return {}, sorted({volume_label(item) for item in items}), ""
-    return fees, [], "florist_fee"
+        stems = {item.id: value if value > 0 else 1 for item, value in [(item, stems[item.id]) for item in items]}
+        return stems, [], "partial_default_stems"
+    return {item.id: 1 for item in items}, [], "equal"
 
 
 def split_stems_by_weight(amount, items):
@@ -929,7 +951,7 @@ def florist_close_plan(florist, batch, return_stems=0, absorb_remainder=True):
     held = balance.remaining_stems if balance else 0
     return_stems = int(return_stems or 0)
     amount = max(held - return_stems, 0)
-    rows = florist_open_catalog_rows(florist, batch)
+    rows, appending = florist_distribution_rows(florist, batch)
     items = [row.catalog_item for row in rows]
     if florist.staff_type == "florist":
         weights, missing, weight_source = florist_weight_plan(florist, items)
@@ -950,6 +972,7 @@ def florist_close_plan(florist, batch, return_stems=0, absorb_remainder=True):
         unplaced = 0
     return {
         "weight_source": weight_source,
+        "distribution_mode": "append_to_catalog" if appending else "open_rows",
         "batch_id": batch.id,
         "batch_number": batch.batch_number,
         "flower": str(batch.variant),
@@ -1014,13 +1037,11 @@ def close_florist_issue(florist, batch, return_stems=0, user=None, absorb_remain
                 summary=f"{florist} chiqimi yopildi, {return_stems} dona skladga qaytdi", after=result,
             )
             return result
-        rows = florist_open_catalog_rows(florist, batch)
+        rows, appending = florist_distribution_rows(florist, batch)
         items = [row.catalog_item for row in rows]
         if not items:
-            if absorb_remainder:
-                return absorb_florist_remainder(florist, batch, user)
             raise ValueError(
-                f"{florist} da bu guldan yasalgan, soni yozilmagan katalog yo‘q. "
+                f"{florist} da taqsimlash uchun katalog topilmadi. "
                 f"Qolgan {amount} dona gulni skladga qaytaring yoki chiqitga yozing."
             )
         if florist.staff_type == "florist":
@@ -1029,11 +1050,6 @@ def close_florist_issue(florist, batch, return_stems=0, user=None, absorb_remain
             weights = {item.id: 1 for item in items}
             missing = []
             weight_source = "apprentice_equal"
-        if missing:
-            raise ValueError(
-                f"{florist} uchun hajm tarifi to‘liq emas: " + ", ".join(missing)
-                + ". Shu hajmlarga dona sonini yoki florist haqini kiriting."
-            )
         weighted = [(item, int(item.quantity_total or 1), weights.get(item.id, 0)) for item in items]
         plan, unplaced = split_stems_by_weight(amount, weighted)
         absorbed_remainder = 0
@@ -1052,9 +1068,12 @@ def close_florist_issue(florist, batch, return_stems=0, user=None, absorb_remain
             if stems < 1:
                 continue
             row = by_item[item.id]
-            row.quantity_stems = stems
-            row.quantity_bunches = (Decimal(stems) / Decimal(batch.stems_per_bunch or 1)).quantize(Decimal("0.01"))
-            row.save(update_fields=["quantity_stems", "quantity_bunches", "updated_at"])
+            row.quantity_stems = row.quantity_stems + stems if row.pk else stems
+            row.quantity_bunches = (Decimal(row.quantity_stems) / Decimal(batch.stems_per_bunch or 1)).quantize(Decimal("0.01"))
+            if row.pk:
+                row.save(update_fields=["quantity_stems", "quantity_bunches", "updated_at"])
+            else:
+                row.save()
             moved += stems * units
             result["items"].append({
                 "catalog_item": item.id,
@@ -1063,8 +1082,9 @@ def close_florist_issue(florist, batch, return_stems=0, user=None, absorb_remain
                 "volume": item.volume,
                 "quantity_total": units,
                 "standard_stems": weight,
-                "stems_per_item": stems,
+                "stems_per_item": row.quantity_stems,
                 "stems_total": stems * units,
+                "added_per_item": stems,
             })
         if absorbed_remainder:
             balance.remaining_stems = 0
@@ -1076,6 +1096,7 @@ def close_florist_issue(florist, batch, return_stems=0, user=None, absorb_remain
         result["absorbed_remainder"] = absorbed_remainder
         result["rounded_extra_stems"] = rounded_extra
         result["weight_source"] = weight_source
+        result["distribution_mode"] = "append_to_catalog" if appending else "open_rows"
         for item, _, _ in weighted:
             sync_catalog_financials(item)
         AuditLog.objects.create(
